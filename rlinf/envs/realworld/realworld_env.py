@@ -26,6 +26,15 @@ import torch
 from filelock import FileLock
 from omegaconf import OmegaConf
 
+from rlinf.envs.realworld.common.wrappers import (
+    GelloIntervention,
+    GripperCloseEnv,
+    KeyboardRewardDoneMultiStageWrapper,
+    KeyboardRewardDoneWrapper,
+    Quat2EulerWrapper,
+    RelativeFrame,
+    SpacemouseIntervention,
+)
 from rlinf.envs.realworld.venv import NoAutoResetSyncVectorEnv
 from rlinf.envs.utils import to_tensor
 from rlinf.scheduler import WorkerInfo
@@ -79,6 +88,47 @@ class RealWorldEnv(gym.Env):
             env_idx=env_idx,
             env_cfg=self.cfg,
         )
+        if self.cfg.get("no_gripper", True):
+            action_shape = getattr(env.action_space, "shape", None)
+            if action_shape != (7,):
+                raise NotImplementedError(
+                    "no_gripper=True currently requires an env with 7D action space, "
+                    f"but got action_shape={action_shape} for env id "
+                    f"{self.cfg.init_params.id!r}."
+                )
+            env = GripperCloseEnv(env)
+        use_spacemouse = self.cfg.get("use_spacemouse", True)
+        use_gello = self.cfg.get("use_gello", False)
+        if use_spacemouse and use_gello:
+            raise ValueError(
+                "use_spacemouse and use_gello are mutually exclusive. "
+                "Please set only one of them to True."
+            )
+        no_gripper = self.cfg.get("no_gripper", True)
+        gripper_enabled = not no_gripper
+        if not env.config.is_dummy and use_spacemouse:
+            env = SpacemouseIntervention(env, gripper_enabled=gripper_enabled)
+        if not env.config.is_dummy and use_gello:
+            gello_port = self.cfg.get("gello_port", None)
+            if gello_port is None:
+                raise ValueError(
+                    "use_gello is True but gello_port is not set in the env config. "
+                    "Please set env.eval.gello_port (or env.train.gello_port) to the "
+                    "serial port of your GELLO device."
+                )
+            env = GelloIntervention(
+                env, port=gello_port, gripper_enabled=gripper_enabled
+            )
+        if not env.config.is_dummy and self.cfg.get("keyboard_reward_wrapper", None):
+            if self.cfg.keyboard_reward_wrapper == "multi_stage":
+                env = KeyboardRewardDoneMultiStageWrapper(env)
+            elif self.cfg.keyboard_reward_wrapper == "single_stage":
+                env = KeyboardRewardDoneWrapper(env)
+
+        if self.cfg.get("use_relative_frame", True):
+            env = RelativeFrame(env)
+        if self.cfg.get("use_quat2euler", True):
+            env = Quat2EulerWrapper(env)
         return env
 
     @staticmethod

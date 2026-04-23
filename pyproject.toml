@@ -143,16 +143,51 @@ xsquare_turtle2 = [
     "evdev",
     "lerobot @ git+https://github.com/huggingface/lerobot.git@0cf864870cf29f4738d3ade893e6fd13fbd7cdb5"
 ]
+realworld_agilex = [
+    "python-socketio>=5",
+    "flask-socketio>=5",
+    "opencv-python",
+    "pynput",
+]
 
 [tool.uv]
 prerelease = "allow"
 conflicts = [
     [
       { extra = "agentic-sglang" },
+      { extra = "agentic-vllm" }
+    ],
+    [
+      { extra = "agentic-sglang" },
+      { extra = "embodied" },
+    ],
+    [
+      { extra = "agentic-sglang" },
+      { extra = "franka" },
+    ],
+    [
+      { extra = "agentic-sglang" },
+      { extra = "xsquare_turtle2" },
+    ],
+    [
+      { extra = "agentic-sglang" },
+      { extra = "realworld_agilex" }
+    ],
+    [
       { extra = "agentic-vllm" },
       { extra = "embodied" },
+    ],
+    [
+      { extra = "agentic-vllm" },
       { extra = "franka" },
-      { extra = "xsquare_turtle2" }
+    ],
+    [
+      { extra = "agentic-vllm" },
+      { extra = "xsquare_turtle2" },
+    ],
+    [
+      { extra = "agentic-vllm" },
+      { extra = "realworld_agilex" }
     ],
 ]
 override-dependencies = [
@@ -166,6 +201,7 @@ override-dependencies = [
     "setuptools>=69.5.1,<75.9",
     "datasets==3.6.0",
     "peft==0.11.1",
+    "pyarrow<24",
 ]
 
 [tool.setuptools]

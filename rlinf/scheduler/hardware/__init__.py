@@ -23,6 +23,8 @@ from .hardware import (
 from .robots import (
     DOSW1HWConfig,
     DOSW1HWInfo,
+    AgilexConfig,
+    AgilexHWInfo,
     DualFrankaConfig,
     DualFrankaHWInfo,
     FrankaConfig,
@@ -42,6 +44,8 @@ __all__ = [
     "NodeHardwareConfig",
     "DOSW1HWConfig",
     "DOSW1HWInfo",
+    "AgilexConfig",
+    "AgilexHWInfo",
     "DualFrankaConfig",
     "DualFrankaHWInfo",
     "FrankaConfig",

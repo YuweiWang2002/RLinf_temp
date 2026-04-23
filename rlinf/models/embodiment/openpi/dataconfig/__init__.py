@@ -29,6 +29,9 @@ from openpi.training.config import (
 from rlinf.models.embodiment.openpi.dataconfig.behavior_dataconfig import (
     LeRobotBehaviorDataConfig,
 )
+from rlinf.models.embodiment.openpi.dataconfig.agilex_dataconfig import (
+    LeRobotAgilexDataConfig,
+)
 from rlinf.models.embodiment.openpi.dataconfig.calvin_dataconfig import (
     LeRobotCalvinDataConfig,
 )
@@ -303,6 +306,35 @@ _CONFIGS = [
                 assets_dir="checkpoints/torch/pi05_aloha_robotwin/assets"
             ),
             extra_delta_transform=True,  # True for delta action, False for abs_action
+        ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi0_agilex_realworld",
+        model=pi0_config.Pi0Config(discrete_state_input=False),
+        data=LeRobotAgilexDataConfig(
+            repo_id="physical-intelligence/agilex-realworld",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="checkpoints/torch/pi0_base/assets",
+            ),
+            extra_delta_transform=False,
+        ),
+        freeze_filter=pi0_config.Pi0Config().get_freeze_filter(),
+        pytorch_weight_path="checkpoints/torch/pi0_base",
+        num_train_steps=30_000,
+    ),
+    TrainConfig(
+        name="pi05_agilex_realworld",
+        model=pi0_config.Pi0Config(pi05=True, discrete_state_input=True),
+        data=LeRobotAgilexDataConfig(
+            repo_id="physical-intelligence/agilex-realworld",
+            base_config=DataConfig(prompt_from_task=True),
+            assets=AssetsConfig(
+                assets_dir="checkpoints/torch/pi05_base/assets",
+            ),
+            extra_delta_transform=False,
         ),
         pytorch_weight_path="checkpoints/torch/pi05_base",
         num_train_steps=20_000,

@@ -14,6 +14,8 @@
 
 from .dosw1 import DOSW1Config, DOSW1Env
 from .dosw1 import tasks as dosw1_tasks
+from .agilex import AgilexEnv, AgilexRobotConfig, AgilexRobotState
+from .agilex import tasks as agilex_tasks
 from .franka import FrankaEnv, FrankaRobotConfig, FrankaRobotState
 from .franka import tasks as franka_tasks
 from .franka.dual_franka_env import DualFrankaEnv, DualFrankaRobotConfig
@@ -24,6 +26,10 @@ from .xsquare import tasks as xsquare_tasks
 RealWorldEnv.realworld_setup()
 
 __all__ = [
+    "AgilexEnv",
+    "AgilexRobotConfig",
+    "AgilexRobotState",
+    "agilex_tasks",
     "DualFrankaEnv",
     "DualFrankaRobotConfig",
     "DOSW1Config",

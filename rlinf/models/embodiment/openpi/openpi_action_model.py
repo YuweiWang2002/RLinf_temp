@@ -474,6 +474,28 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         return result
 
     def obs_processor(self, env_obs):
+        # Agilex online realworld uses three fixed camera streams. Keep the online
+        # slash-key schema so agilex_policy._decode_aloha can take the online branch.
+        if "agilex" in self.config.config_name:
+            extra_view_images = env_obs.get("extra_view_images", None)
+            if extra_view_images is None:
+                raise KeyError(
+                    "Agilex obs_processor expects env_obs['extra_view_images'] with "
+                    "left/right wrist views."
+                )
+            if extra_view_images.ndim != 5 or extra_view_images.shape[1] < 2:
+                raise ValueError(
+                    "Agilex extra_view_images must have shape [B, N, H, W, C] with N>=2. "
+                    f"Got {extra_view_images.shape}."
+                )
+
+            return {
+                "observation/image": env_obs["main_images"],
+                "observation/state": env_obs["states"],
+                "observation/extra_view_image": extra_view_images,
+                "prompt": env_obs["task_descriptions"],
+            }
+
         # base observation
         processed_obs = {
             "observation/image": env_obs["main_images"],

@@ -1,4 +1,4 @@
-# Copyright 2025 The RLinf Authors.
+# Copyright 2026 The RLinf Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,21 +12,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .dosw1 import DOSW1HWConfig, DOSW1HWInfo
-from .agilex import AgilexConfig, AgilexHWInfo
-from .dual_franka import DualFrankaConfig, DualFrankaHWInfo
-from .franka import FrankaConfig, FrankaHWInfo
-from .xsquare import Turtle2Config, Turtle2HWInfo
+from dataclasses import asdict, dataclass, field
 
-__all__ = [
-    "DOSW1HWConfig",
-    "DOSW1HWInfo",
-    "AgilexConfig",
-    "AgilexHWInfo",
-    "DualFrankaConfig",
-    "DualFrankaHWInfo",
-    "FrankaConfig",
-    "FrankaHWInfo",
-    "Turtle2Config",
-    "Turtle2HWInfo",
-]
+import numpy as np
+
+
+@dataclass
+class AgilexRobotState:
+    """Runtime robot-side state snapshot for Agilex realworld env."""
+
+    joint_state: np.ndarray = field(default_factory=lambda: np.zeros((14,)))
+    success: bool = False
+
+    def to_dict(self) -> dict:
+        """Convert the dataclass to a serializable dictionary."""
+        return asdict(self)

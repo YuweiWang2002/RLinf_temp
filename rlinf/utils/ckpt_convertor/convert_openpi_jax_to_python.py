@@ -52,6 +52,43 @@ from flax.nnx import traversals
 from openpi.training import utils
 
 
+def _resolve_model_config(config_name: str) -> openpi.models.pi0_config.Pi0Config:
+    """Resolve Pi0 config from OpenPI registry, then fallback to RLinf registry."""
+    config_source = "openpi.training.config"
+    openpi_lookup_error = None
+
+    try:
+        train_cfg = _config.get_config(config_name)
+        model_config = train_cfg.model
+    except Exception as exc:
+        openpi_lookup_error = exc
+        try:
+            from rlinf.models.embodiment.openpi.dataconfig import get_openpi_config
+
+            train_cfg = get_openpi_config(config_name)
+            model_config = train_cfg.model
+            config_source = "rlinf.models.embodiment.openpi.dataconfig"
+        except Exception as fallback_exc:
+            raise ValueError(
+                f"Config '{config_name}' not found in OpenPI or RLinf registries."
+            ) from fallback_exc
+
+    if not isinstance(model_config, openpi.models.pi0_config.Pi0Config):
+        raise ValueError(
+            f"Config {config_name} (from {config_source}) is not a Pi0Config"
+        )
+
+    if openpi_lookup_error is not None:
+        print(
+            "Fallback to RLinf OpenPI config registry because OpenPI lookup failed "
+            f"for '{config_name}': {openpi_lookup_error}"
+        )
+    else:
+        print(f"Using config '{config_name}' from {config_source}")
+
+    return model_config
+
+
 def slice_paligemma_state_dict(state_dict, config):
     """Convert PaliGemma JAX parameters to PyTorch format."""
     suffix = "/value" if "img/embedding/kernel/value" in state_dict else ""
@@ -688,9 +725,7 @@ def main(
         precision: Precision for model conversion
         inspect_only: Only inspect parameter keys, don't convert
     """
-    model_config = _config.get_config(config_name).model
-    if not isinstance(model_config, openpi.models.pi0_config.Pi0Config):
-        raise ValueError(f"Config {config_name} is not a Pi0Config")
+    model_config = _resolve_model_config(config_name)
     if inspect_only:
         load_jax_model_and_print_keys(checkpoint_dir)
     else:
