@@ -27,7 +27,10 @@ class AgilexRobotConfig:
     max_num_steps: int = 100
     image_height: int = 480
     image_width: int = 640
+    startup_check_timeout_s: float | None = 120.0
+    startup_check_poll_interval_s: float = 1.0
     reset_timeout_s: float | None = None
+    start_timeout_s: float | None = None
     observation_timeout_s: float = 10.0
     observation_poll_interval_s: float = 0.1
 
@@ -66,6 +69,11 @@ class AgilexEnv(gym.Env):
             self._client = None
         self._dummy_joint_state = np.zeros((AGILEX_ACTION_DIM,), dtype=np.float32)
         self._num_steps = 0
+        self._operator_confirmed = False
+        self._episode_started = False
+        self._connection_generation = (
+            0 if self._client is None else self._client.connection_generation
+        )
 
         self.action_space = gym.spaces.Box(
             low=-np.inf,
@@ -133,6 +141,38 @@ class AgilexEnv(gym.Env):
                 f"robot_port must be a positive integer, but got {self.config.robot_port}."
             )
 
+    def _run_startup_check_once(self) -> None:
+        assert self._client is not None, "Robot bridge client must be initialized."
+        response = self._client.wait_startup_check(
+            timeout=self.config.startup_check_timeout_s,
+            poll_interval=self.config.startup_check_poll_interval_s,
+        )
+        status = str(response.get("status", ""))
+        if status != "success":
+            raise RuntimeError(
+                "Robot bridge startup check failed: "
+                f"status={status!r}, response={response!r}."
+            )
+
+    def _sync_bridge_session_state(self) -> None:
+        assert self._client is not None, "Robot bridge client must be initialized."
+        generation = self._client.connection_generation
+        if generation == self._connection_generation:
+            return
+
+        self._connection_generation = generation
+        self._operator_confirmed = False
+        self._episode_started = False
+
+    def _ensure_startup_confirmed(self) -> None:
+        assert self._client is not None, "Robot bridge client must be initialized."
+        self._sync_bridge_session_state()
+        if self._operator_confirmed:
+            return
+
+        self._run_startup_check_once()
+        self._operator_confirmed = True
+
     def close(self) -> None:
         if self._client is not None:
             self._client.close()
@@ -141,6 +181,7 @@ class AgilexEnv(gym.Env):
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
         self._num_steps = 0
+        self._episode_started = False
         if self.config.is_dummy:
             self._dummy_joint_state.fill(0.0)
             self._agilex_state.joint_state = self._dummy_joint_state.copy()
@@ -148,12 +189,21 @@ class AgilexEnv(gym.Env):
             return self._get_dummy_observation(), {"reset_success": True}
 
         assert self._client is not None, "Robot bridge client must be initialized."
+        self._ensure_startup_confirmed()
         response = self._client.reset(
             manual_reset=self.config.require_manual_reset,
             timeout=self.config.reset_timeout_s,
         )
         if response is None:
             raise RuntimeError("Robot bridge reset failed or returned no response.")
+        status = str(response.get("status", ""))
+        if status != "success":
+            state = response.get("state", "unknown")
+            reason = response.get("reason", "unknown")
+            raise RuntimeError(
+                "Robot bridge reset failed: "
+                f"status={status!r}, state={state!r}, reason={reason!r}."
+            )
         observation = self._wait_for_observation()
         return observation, {"reset_success": True}
 
@@ -175,6 +225,8 @@ class AgilexEnv(gym.Env):
             }
 
         assert self._client is not None, "Robot bridge client must be initialized."
+        self._ensure_startup_confirmed()
+        self._start_episode_if_needed()
         self._client.publish_joint_commands(
             left_joints=action[:7].tolist(),
             right_joints=action[7:14].tolist(),
@@ -189,6 +241,27 @@ class AgilexEnv(gym.Env):
             "task_success": bool(raw_observation.get("success", False)),
         }
         return observation, reward, terminated, truncated, info
+
+    def _start_episode_if_needed(self) -> None:
+        if self._episode_started:
+            return
+
+        assert self._client is not None, "Robot bridge client must be initialized."
+        response = self._client.start_episode(
+            timeout=self.config.start_timeout_s,
+        )
+        if response is None:
+            raise RuntimeError("Robot bridge start failed or returned no response.")
+
+        status = str(response.get("status", ""))
+        if status != "success":
+            state = response.get("state", "unknown")
+            reason = response.get("reason", "unknown")
+            raise RuntimeError(
+                "Robot bridge start failed: "
+                f"status={status!r}, state={state!r}, reason={reason!r}."
+            )
+        self._episode_started = True
 
     def _wait_for_observation(
         self, *, return_raw: bool = False

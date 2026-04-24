@@ -32,6 +32,12 @@ class AgilexRobotSideBridge:
 
     def __init__(self, args: argparse.Namespace):
         self.args = args
+        self._state_lock = threading.Lock()
+        self._operator_confirmed = False
+        self._episode_started = False
+        self._session_generation = 0
+        self._confirmation_error: str | None = None
+        self._startup_confirmation_thread: threading.Thread | None = None
         self.image_deques = {
             "cam_high": deque(maxlen=10),
             "cam_left_wrist": deque(maxlen=10),
@@ -93,12 +99,96 @@ class AgilexRobotSideBridge:
             self._publish_alive,
         )
 
-    def get_observation(self, prompt: str) -> dict | None:
+    def _is_robot_ready(self) -> tuple[bool, str | None]:
         if not all(self.image_deques.values()):
-            rospy.logwarn_throttle(5.0, "Agilex bridge is waiting for compressed camera frames.")
-            return None
+            return False, "camera_frames_not_ready"
         if not all(self.joint_state_deques.values()):
-            rospy.logwarn_throttle(5.0, "Agilex bridge is waiting for front arm joint states.")
+            return False, "joint_states_not_ready"
+        return True, None
+
+    def _reset_session(self) -> None:
+        with self._state_lock:
+            self._session_generation += 1
+            self._operator_confirmed = False
+            self._episode_started = False
+            self._confirmation_error = None
+            self._startup_confirmation_thread = None
+
+    def _get_runtime_state(self) -> tuple[str, str | None]:
+        is_ready, reason = self._is_robot_ready()
+        if not is_ready:
+            return "BLOCKED", reason
+
+        with self._state_lock:
+            if self._confirmation_error is not None:
+                return "BLOCKED", self._confirmation_error
+            if not self._operator_confirmed:
+                return "BLOCKED", "waiting_operator_confirm"
+            if not self._episode_started:
+                return "IDLE", None
+        return "RUNNING", None
+
+    def _build_state_response(self, status: str, **kwargs: Any) -> dict[str, Any]:
+        state, reason = self._get_runtime_state()
+        response: dict[str, Any] = {
+            "status": status,
+            "state": state,
+        }
+        if reason is not None:
+            response["reason"] = reason
+        response.update(kwargs)
+        return response
+
+    def _confirm_startup(self, session_generation: int) -> None:
+        confirmation_error = None
+        try:
+            input("\n[ROBOT] Link is ready. Press Enter to allow policy to start.\n")
+        except EOFError:
+            confirmation_error = "confirm_input_unavailable"
+
+        with self._state_lock:
+            if session_generation != self._session_generation:
+                return
+            self._operator_confirmed = confirmation_error is None
+            self._confirmation_error = confirmation_error
+            self._startup_confirmation_thread = None
+
+    def _ensure_startup_confirmation_requested(self) -> None:
+        with self._state_lock:
+            if self._operator_confirmed or self._confirmation_error is not None:
+                return
+            if (
+                self._startup_confirmation_thread is not None
+                and self._startup_confirmation_thread.is_alive()
+            ):
+                return
+
+            session_generation = self._session_generation
+            self._startup_confirmation_thread = threading.Thread(
+                target=self._confirm_startup,
+                args=(session_generation,),
+                daemon=True,
+            )
+            self._startup_confirmation_thread.start()
+
+    def handle_client_connected(self, sid: str) -> dict[str, Any]:
+        self._reset_session()
+        return self._build_state_response("connected", sid=sid)
+
+    def handle_client_disconnected(self) -> None:
+        self._reset_session()
+
+    def get_observation(self, prompt: str) -> dict | None:
+        is_ready, reason = self._is_robot_ready()
+        if not is_ready and reason == "camera_frames_not_ready":
+            rospy.logwarn_throttle(
+                5.0, "Agilex bridge is waiting for compressed camera frames."
+            )
+            return None
+        if not is_ready and reason == "joint_states_not_ready":
+            rospy.logwarn_throttle(
+                5.0, "Agilex bridge is waiting for front arm joint states."
+            )
             return None
 
         sync_time = self.image_deques["cam_high"][-1].header.stamp
@@ -147,8 +237,17 @@ class AgilexRobotSideBridge:
         left_joints: list[float],
         right_joints: list[float],
         *,
+        allow_before_episode_start: bool = False,
         sleep: bool = True,
     ) -> None:
+        state, reason = self._get_runtime_state()
+        if state == "BLOCKED":
+            raise RuntimeError(f"Robot bridge is blocked: reason={reason!r}.")
+        if not allow_before_episode_start and state != "RUNNING":
+            raise RuntimeError(
+                "Episode is not started. Call start_episode before sending actions."
+            )
+
         header = Header(stamp=rospy.Time.now())
         joint_names = [f"joint{i}" for i in range(7)]
         self.left_publisher.publish(
@@ -180,7 +279,12 @@ class AgilexRobotSideBridge:
                 (1.0 - alpha) * start + alpha * target
                 for start, target in zip(start_right, target_right)
             ]
-            self.publish_joint_commands(interp_left, interp_right, sleep=False)
+            self.publish_joint_commands(
+                interp_left,
+                interp_right,
+                allow_before_episode_start=True,
+                sleep=False,
+            )
             reset_rate.sleep()
 
     def move_to_default_pose(self) -> None:
@@ -197,6 +301,13 @@ class AgilexRobotSideBridge:
         if manual_reset is None:
             manual_reset = self.args.require_manual_reset
 
+        state, reason = self._get_runtime_state()
+        if state == "BLOCKED":
+            status = "error" if reason == "confirm_input_unavailable" else "blocked"
+            return self._build_state_response(status, manual_reset=bool(manual_reset))
+
+        with self._state_lock:
+            self._episode_started = False
         self.toggle_intervention(False)
         self.move_to_default_pose()
 
@@ -205,13 +316,36 @@ class AgilexRobotSideBridge:
                 input("\n[ROBOT] Reset the scene manually, then press Enter to continue.\n")
             except EOFError as exc:
                 raise RuntimeError(
-                    "Manual reset was requested, but stdin is not available for confirmation."
+                    "Manual reset was requested, but stdin is not available for "
+                    "confirmation."
                 ) from exc
 
-        return {
-            "status": "success",
-            "manual_reset": bool(manual_reset),
-        }
+        return self._build_state_response("success", manual_reset=bool(manual_reset))
+
+    def handle_start(self, _request_data: dict[str, Any] | None = None) -> dict[str, Any]:
+        state, reason = self._get_runtime_state()
+        if state == "BLOCKED":
+            status = "error" if reason == "confirm_input_unavailable" else "blocked"
+            return self._build_state_response(status, started=False)
+        if state == "RUNNING":
+            return self._build_state_response("success", started=True)
+
+        with self._state_lock:
+            self._episode_started = True
+        return self._build_state_response("success", started=True)
+
+    def handle_startup_check(
+        self, _request_data: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        state, reason = self._get_runtime_state()
+        if state == "BLOCKED" and reason == "waiting_operator_confirm":
+            self._ensure_startup_confirmation_requested()
+            state, reason = self._get_runtime_state()
+
+        if state == "BLOCKED":
+            status = "error" if reason == "confirm_input_unavailable" else "blocked"
+            return self._build_state_response(status, checked=False)
+        return self._build_state_response("success", checked=True)
 
 
 BRIDGE: AgilexRobotSideBridge | None = None
@@ -229,7 +363,14 @@ def on_press(key):
 
 @socketio.on("connect")
 def handle_connect():
-    return {"status": "connected", "sid": request.sid}
+    assert BRIDGE is not None
+    return BRIDGE.handle_client_connected(request.sid)
+
+
+@socketio.on("disconnect")
+def handle_disconnect():
+    assert BRIDGE is not None
+    BRIDGE.handle_client_disconnected()
 
 
 @socketio.on("reset_state")
@@ -245,6 +386,18 @@ def handle_get_observation(data):
     return BRIDGE.get_observation(prompt)
 
 
+@socketio.on("start_episode")
+def handle_start_episode(data=None):
+    assert BRIDGE is not None
+    return BRIDGE.handle_start(data)
+
+
+@socketio.on("startup_check")
+def handle_startup_check(data=None):
+    assert BRIDGE is not None
+    return BRIDGE.handle_startup_check(data)
+
+
 @socketio.on("publish_joint_commands")
 def handle_publish_joint_commands(data):
     assert BRIDGE is not None
@@ -253,9 +406,7 @@ def handle_publish_joint_commands(data):
 
 
 def setup_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="RLinf Agilex robot-side bridge"
-    )
+    parser = argparse.ArgumentParser(description="RLinf Agilex robot-side bridge")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--publish-rate", type=int, default=20)

@@ -8,6 +8,7 @@ from typing import Any
 
 import numpy as np
 
+
 LOGGER = logging.getLogger(__name__)
 
 
@@ -35,6 +36,7 @@ class AgilexPolicySideBridge:
         self._port = port
         self.server_url = f"http://{host}:{port}"
         self._connected_event = threading.Event()
+        self._connection_generation = 0
         self._client = socketio.Client(
             logger=False,
             engineio_logger=False,
@@ -48,6 +50,7 @@ class AgilexPolicySideBridge:
     def _register_handlers(self) -> None:
         @self._client.event
         def connect():
+            self._connection_generation += 1
             self._connected_event.set()
 
         @self._client.event
@@ -65,7 +68,7 @@ class AgilexPolicySideBridge:
         while True:
             elapsed_seconds = int(time.monotonic() - start_time)
             LOGGER.info(
-                "正在连接 %s:%s，已等待 %d 秒",
+                "Connecting to %s:%s, waited %d seconds",
                 self._host,
                 self._port,
                 elapsed_seconds,
@@ -99,6 +102,10 @@ class AgilexPolicySideBridge:
     def ready(self) -> bool:
         return self._client.connected
 
+    @property
+    def connection_generation(self) -> int:
+        return self._connection_generation
+
     def close(self) -> None:
         if self._client.connected:
             self._client.disconnect()
@@ -115,6 +122,61 @@ class AgilexPolicySideBridge:
         if manual_reset is not None:
             payload["manual_reset"] = bool(manual_reset)
         return self._client.call("reset_state", payload, timeout=timeout)
+
+    def start_episode(
+        self,
+        *,
+        timeout: float | None = None,
+    ) -> dict | None:
+        if not self.ready:
+            return None
+        return self._client.call("start_episode", {}, timeout=timeout)
+
+    def startup_check(
+        self,
+        *,
+        timeout: float | None = None,
+    ) -> dict | None:
+        if not self.ready:
+            return None
+        return self._client.call("startup_check", {}, timeout=timeout)
+
+    def wait_startup_check(
+        self,
+        *,
+        timeout: float | None = 120.0,
+        poll_interval: float = 1.0,
+        request_timeout: float = 10.0,
+    ) -> dict:
+        start_time = time.monotonic()
+        while True:
+            response = self.startup_check(timeout=request_timeout)
+            if response is None:
+                raise RuntimeError("Robot bridge startup check returned no response.")
+
+            status = str(response.get("status", ""))
+            if status == "success":
+                return response
+
+            reason = str(response.get("reason", "unknown"))
+            if status != "blocked":
+                raise RuntimeError(
+                    "Robot bridge startup check failed: "
+                    f"status={status!r}, response={response!r}."
+                )
+
+            elapsed = time.monotonic() - start_time
+            LOGGER.info(
+                "Robot bridge is not ready yet: reason=%s, waited=%.1fs",
+                reason,
+                elapsed,
+            )
+            if timeout is not None and elapsed >= timeout:
+                raise TimeoutError(
+                    "Robot bridge startup check timed out "
+                    f"after {int(timeout)} seconds (last reason={reason!r})."
+                )
+            time.sleep(poll_interval)
 
     def get_observation(self, prompt: str) -> collections.OrderedDict | None:
         if not self.ready:
