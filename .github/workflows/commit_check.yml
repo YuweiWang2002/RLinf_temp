@@ -23,7 +23,7 @@ jobs:
           branch: false
           author-name: false
           author-email: false
-          commit-signoff: true
+          commit-signoff: false
           merge-base: false
           imperative: false
           job-summary: true
