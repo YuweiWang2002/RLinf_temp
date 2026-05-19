@@ -60,6 +60,7 @@ class RoboTwinEnv(gym.Env):
         self._is_start = True
 
         self.task_name = cfg.task_config.task_name
+        self.robotwin_action_mode = cfg.get("robotwin_action_mode", "qpos14")
 
         self.center_crop = cfg.get("center_crop", False)
         self._init_reset_state_ids()
@@ -272,6 +273,18 @@ class RoboTwinEnv(gym.Env):
             # [n_envs, action_dim] -> [n_envs, 1, action_dim]
             actions = actions[:, None, :]
 
+        if self._is_ee16_action_mode():
+            obs_list, rewards, terminations, truncations, infos_list = (
+                self._chunk_step_ee16(actions, auto_reset=auto_reset)
+            )
+            return (
+                obs_list[-1],
+                rewards[:, -1],
+                terminations[:, -1],
+                truncations[:, -1],
+                infos_list[-1],
+            )
+
         raw_obs, step_reward, terminations, truncations, info_list = self.venv.step(
             actions
         )
@@ -322,6 +335,9 @@ class RoboTwinEnv(gym.Env):
             chunk_actions = chunk_actions.cpu().numpy()
 
         # chunk_actions: [num_envs, chunk_step, action_dim]
+        if self._is_ee16_action_mode():
+            return self._chunk_step_ee16(chunk_actions)
+
         num_envs = chunk_actions.shape[0]
         chunk_step = chunk_actions.shape[1]
         obs_list = []
@@ -388,6 +404,204 @@ class RoboTwinEnv(gym.Env):
             chunk_truncations,
             infos_list,
         )
+
+    def _is_ee16_action_mode(self) -> bool:
+        return self.robotwin_action_mode in ("ee16", "endpose16")
+
+    def _validate_ee16_action(self, action: np.ndarray) -> None:
+        if action.shape != (self.num_envs, 16):
+            msg = (
+                "RoboTwin ee16 action mode requires step actions with shape "
+                f"({self.num_envs}, 16), got {action.shape}."
+            )
+            raise ValueError(msg)
+
+    def _validate_ee16_chunk_actions(self, actions: np.ndarray) -> None:
+        if actions.ndim != 3 or actions.shape[0] != self.num_envs or actions.shape[-1] != 16:
+            msg = (
+                "RoboTwin ee16 action mode requires chunk actions with shape "
+                f"({self.num_envs}, chunk_len, 16), got {actions.shape}."
+            )
+            raise ValueError(msg)
+
+    def _get_ee16_tasks(self):
+        envs = getattr(self.venv, "envs", None)
+        if envs is None or len(envs) != self.num_envs:
+            msg = (
+                "RoboTwin ee16 action mode requires self.venv.envs with one "
+                "task-bearing sub-env per RLinf env. This wrapper will not "
+                "silently fall back to qpos."
+            )
+            raise NotImplementedError(msg)
+        tasks = []
+        for env_id, env in enumerate(envs):
+            task = getattr(env, "task", None)
+            if task is None or not hasattr(task, "take_action"):
+                msg = (
+                    "RoboTwin ee16 action mode requires each sub-env to expose "
+                    f"task.take_action; env_id={env_id} is missing it."
+                )
+                raise NotImplementedError(msg)
+            tasks.append(task)
+        return tasks
+
+    def _step_ee16_action(self, action: np.ndarray, auto_reset=True):
+        self._validate_ee16_action(action)
+        tasks = self._get_ee16_tasks()
+        for env_id, task in enumerate(tasks):
+            robotwin_action = self._canonical_ee16_xyzw_to_robotwin_wxyz(action[env_id])
+            robotwin_action = self._avoid_robotwin_zero_step_ee_plan(
+                task,
+                robotwin_action,
+            )
+            if robotwin_action is not None:
+                task.take_action(robotwin_action, action_type="ee")
+
+        raw_obs = self.venv.get_obs()
+        extracted_obs = self._extract_obs_image(raw_obs)
+        info_list = []
+        for task in tasks:
+            success = bool(getattr(task, "eval_success", False))
+            info_list.append({"success": success})
+        infos = list_of_dict_to_dict_of_list(info_list)
+
+        terminations = torch.as_tensor(
+            np.array([info["success"] for info in info_list], dtype=bool),
+            device=self.device,
+        )
+        truncations = torch.as_tensor(
+            np.array(
+                [
+                    getattr(task, "step_lim", None) is not None
+                    and getattr(task, "take_action_cnt", 0) >= getattr(task, "step_lim")
+                    and not getattr(task, "eval_success", False)
+                    for task in tasks
+                ],
+                dtype=bool,
+            ),
+            device=self.device,
+        )
+
+        if self.use_custom_reward:
+            step_reward = self._calc_step_reward(terminations)
+        else:
+            step_reward = torch.as_tensor(
+                np.array([float(info["success"]) for info in info_list], dtype=np.float32),
+                device=self.device,
+            )
+
+        self._elapsed_steps += 1
+        truncated = self._elapsed_steps >= self.cfg.max_episode_steps
+        if truncated.any():
+            truncations = torch.logical_or(truncated, truncations)
+
+        infos = self._record_metrics(step_reward, infos)
+
+        if self.ignore_terminations:
+            terminations[:] = False
+            if self.record_metrics and "success" in infos:
+                infos["episode"]["success_at_end"] = infos["success"].clone()
+
+        dones = torch.logical_or(terminations, truncations)
+        _auto_reset = auto_reset and self.auto_reset
+        if dones.any() and _auto_reset:
+            extracted_obs, infos = self._handle_auto_reset(dones, extracted_obs, infos)
+
+        return extracted_obs, step_reward, terminations, truncations, infos
+
+    def _chunk_step_ee16(self, actions: np.ndarray, auto_reset=True):
+        self._validate_ee16_chunk_actions(actions)
+        chunk_step = actions.shape[1]
+        obs_list = []
+        infos_list = []
+        chunk_rewards, raw_terms, raw_truncs = [], [], []
+
+        for step_id in range(chunk_step):
+            obs, reward, terminations, truncations, infos = self._step_ee16_action(
+                actions[:, step_id], auto_reset=False
+            )
+            obs_list.append(obs)
+            infos_list.append(infos)
+            chunk_rewards.append(reward)
+            raw_terms.append(terminations)
+            raw_truncs.append(truncations)
+            if torch.logical_or(terminations, truncations).all():
+                break
+
+        chunk_rewards = torch.stack(chunk_rewards, dim=1)
+        raw_terms = torch.stack(raw_terms, dim=1)
+        raw_truncs = torch.stack(raw_truncs, dim=1)
+
+        if chunk_rewards.shape[1] < chunk_step:
+            pad_len = chunk_step - chunk_rewards.shape[1]
+            chunk_rewards = torch.cat(
+                (
+                    chunk_rewards,
+                    torch.zeros(
+                        self.num_envs,
+                        pad_len,
+                        dtype=chunk_rewards.dtype,
+                        device=chunk_rewards.device,
+                    ),
+                ),
+                dim=1,
+            )
+            raw_terms = torch.cat(
+                (
+                    raw_terms,
+                    raw_terms[:, -1:].expand(self.num_envs, pad_len),
+                ),
+                dim=1,
+            )
+            raw_truncs = torch.cat(
+                (
+                    raw_truncs,
+                    raw_truncs[:, -1:].expand(self.num_envs, pad_len),
+                ),
+                dim=1,
+            )
+
+        past_terminations = raw_terms.any(dim=1)
+        past_truncations = raw_truncs.any(dim=1)
+        past_dones = torch.logical_or(past_terminations, past_truncations)
+        if past_dones.any() and auto_reset and self.auto_reset:
+            obs_list[-1], infos_list[-1] = self._handle_auto_reset(
+                past_dones, obs_list[-1], infos_list[-1]
+            )
+
+        chunk_terminations = torch.zeros_like(raw_terms)
+        chunk_terminations[:, -1] = past_terminations
+        chunk_truncations = torch.zeros_like(raw_truncs)
+        chunk_truncations[:, -1] = past_truncations
+        return obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list
+
+    @staticmethod
+    def _canonical_ee16_xyzw_to_robotwin_wxyz(action: np.ndarray) -> np.ndarray:
+        if action.shape != (16,):
+            msg = f"canonical ee16 action must have shape (16,), got {action.shape}."
+            raise ValueError(msg)
+        converted = np.array(action, copy=True)
+        converted[3:7] = action[[6, 3, 4, 5]]
+        converted[11:15] = action[[14, 11, 12, 13]]
+        return converted
+
+    @staticmethod
+    def _avoid_robotwin_zero_step_ee_plan(task, action: np.ndarray) -> np.ndarray | None:
+        if not hasattr(task, "get_arm_pose"):
+            return action
+
+        current_left = np.asarray(task.get_arm_pose("left"), dtype=np.float64).reshape(7)
+        current_right = np.asarray(task.get_arm_pose("right"), dtype=np.float64).reshape(7)
+        left_hold = np.allclose(action[0:7], current_left, atol=1e-5, rtol=1e-5)
+        right_hold = np.allclose(action[8:15], current_right, atol=1e-5, rtol=1e-5)
+        if left_hold and right_hold:
+            return None
+        guarded = np.array(action, copy=True)
+        if left_hold:
+            guarded[0] += 1e-5
+        if right_hold:
+            guarded[8] += 1e-5
+        return guarded
 
     def _handle_auto_reset(self, dones, extracted_obs, infos):
         final_obs = extracted_obs.copy()

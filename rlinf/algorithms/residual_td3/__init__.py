@@ -15,6 +15,15 @@
 
 from .action_adapter import ResidualActionAdapter, ResidualActionSpec
 from .config import build_residual_action_spec, validate_residual_td3_cfg
+from .endpose_bridge import (
+    EndposeBridge,
+    EndposeBridgeMode,
+    EndposeBridgeSpec,
+    normalize_gripper_column,
+    require_obs_tensor,
+    wxyz_to_xyzw,
+    xyzw_to_wxyz,
+)
 from .schema import (
     ExpertResidualSample,
     ResidualBaseActionSpace,
@@ -29,10 +38,17 @@ __all__ = [
     "ResidualActionAdapter",
     "ResidualActionSpec",
     "ResidualBaseActionSpace",
+    "EndposeBridge",
+    "EndposeBridgeMode",
+    "EndposeBridgeSpec",
     "ResidualFrame",
     "ResidualMode",
     "ResidualObs",
     "ResidualTransition",
     "build_residual_action_spec",
+    "normalize_gripper_column",
+    "require_obs_tensor",
     "validate_residual_td3_cfg",
+    "wxyz_to_xyzw",
+    "xyzw_to_wxyz",
 ]
