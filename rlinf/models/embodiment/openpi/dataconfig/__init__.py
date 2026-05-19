@@ -18,6 +18,7 @@ import difflib
 from typing import Optional
 
 import openpi.models.pi0_config as pi0_config
+import openpi.transforms as _transforms
 import openpi.training.optimizer as _optimizer
 import openpi.training.weight_loaders as weight_loaders
 from openpi.training.config import (
@@ -307,6 +308,40 @@ _CONFIGS = [
             ),
             extra_delta_transform=True,  # True for delta action, False for abs_action
         ),
+        pytorch_weight_path="checkpoints/torch/pi05_base",
+        num_train_steps=20_000,
+    ),
+    TrainConfig(
+        name="pi05_aloha_robotwin_handover",
+        model=pi0_config.Pi0Config(pi05=True),
+        data=LeRobotAlohaDataConfig(
+            repo_id="handover_expert",
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "images": {
+                                "cam_high": "observation.images.cam_high",
+                                "cam_left_wrist": "observation.images.cam_left_wrist",
+                                "cam_right_wrist": "observation.images.cam_right_wrist",
+                            },
+                            "state": "observation.state",
+                            "actions": "action",
+                        }
+                    )
+                ]
+            ),
+            default_prompt=(
+                "Use the left arm to grasp the red block on the table, handover it "
+                "to the right arm and place it on the blue pad."
+            ),
+            extra_delta_transform=False,
+        ),
+        batch_size=16,
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        wandb_enabled=False,
         pytorch_weight_path="checkpoints/torch/pi05_base",
         num_train_steps=20_000,
     ),

@@ -150,7 +150,7 @@ def cat_list_of_dict_tensor(list_of_dict: list, dim=0):
             ret[key] = torch.cat(v_list, dim=dim)
         elif isinstance(_v0, dict):
             v_list = [d[key] for d in list_of_dict]
-            ret[key] = cat_list_of_dict_tensor(v_list)
+            ret[key] = cat_list_of_dict_tensor(v_list, dim=dim)
         else:
             raise ValueError(f"{key=}, {type(_v0)} is not supported!")
     return ret

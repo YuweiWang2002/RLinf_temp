@@ -2,6 +2,7 @@ model_type: "openpi"
 
 # Model path - should be set in specific config files
 model_path: "/path/to/model/openpi"
+norm_stats_path: null
 
 precision: null # for openpi, precision is null, please do not change this value
 

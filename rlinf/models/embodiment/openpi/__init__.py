@@ -13,8 +13,10 @@
 # limitations under the License.
 # openpi model configs
 
+import json
 import os
 
+import numpy as np
 import torch
 from omegaconf import DictConfig
 
@@ -93,8 +95,10 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     data_config = actor_train_config.data.create(
         actor_train_config.assets_dirs, actor_model_config
     )
-    norm_stats = None
-    if norm_stats is None:
+    norm_stats_path = getattr(cfg, "norm_stats_path", None)
+    if norm_stats_path:
+        norm_stats = _load_norm_stats_file(norm_stats_path)
+    else:
         # We are loading the norm stats from the checkpoint instead of the config assets dir to make sure
         # that the policy is using the same normalization stats as the original training process.
         if data_config.asset_id is None:
@@ -124,3 +128,30 @@ def get_model(cfg: DictConfig, torch_dtype=None):
     )
 
     return model
+
+
+def _load_norm_stats_file(norm_stats_path: str):
+    import openpi.transforms as transforms
+
+    with open(norm_stats_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if "norm_stats" in data:
+        data = data["norm_stats"]
+
+    norm_stats = {}
+    for key, value in data.items():
+        norm_stats[key] = transforms.NormStats(
+            mean=np.asarray(value["mean"], dtype=np.float32),
+            std=np.asarray(value["std"], dtype=np.float32),
+            q01=(
+                np.asarray(value["q01"], dtype=np.float32)
+                if value.get("q01") is not None
+                else None
+            ),
+            q99=(
+                np.asarray(value["q99"], dtype=np.float32)
+                if value.get("q99") is not None
+                else None
+            ),
+        )
+    return norm_stats

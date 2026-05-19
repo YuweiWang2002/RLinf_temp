@@ -1,0 +1,35 @@
+residual_td3:
+  enabled: true
+  base_action_space: "robotwin_endpose16"
+  residual_mode: "right_xyz_left_ee_frame"
+  residual_frame: "left_ee"
+  residual_chunk_len: 5
+  env_action_chunk_len: 10
+  base_action_dim: 16
+  base_action_source: "env_action"
+  residual_action_indices: null
+  right_xyz_indices: [8, 9, 10]
+  vla_feature:
+    enabled: false
+    dim: 256
+    source: null
+  rel_state:
+    enabled: true
+    require_ee_pose: true
+    left_ee_rotation_key: "left_ee_rot"
+  history:
+    enabled: false
+    len: 0
+  gate:
+    type: "always"
+    value: 1.0
+  replay:
+    store_in_nested_dict: true
+    namespace: "residual_td3"
+  bc:
+    enabled: true
+    mask_invalid_steps: true
+  safety:
+    delta_max: 0.02
+    clamp_residual: true
+    fail_on_incompatible_action_space: true

@@ -731,23 +731,29 @@ class TrajectoryReplayBuffer:
                 flat[field] = tensor.reshape(-1, *tensor.shape[2:])
 
         if trajectory.curr_obs:
-            flat["curr_obs"] = {}
-            for key, tensor in trajectory.curr_obs.items():
-                if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
-                    flat["curr_obs"][key] = tensor.reshape(-1, *tensor.shape[2:])
+            flat["curr_obs"] = self._flatten_nested_trajectory_dict(
+                trajectory.curr_obs
+            )
 
         if trajectory.next_obs:
-            flat["next_obs"] = {}
-            for key, tensor in trajectory.next_obs.items():
-                if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
-                    flat["next_obs"][key] = tensor.reshape(-1, *tensor.shape[2:])
+            flat["next_obs"] = self._flatten_nested_trajectory_dict(trajectory.next_obs)
 
         if trajectory.forward_inputs:
-            flat["forward_inputs"] = {}
-            for key, tensor in trajectory.forward_inputs.items():
-                if isinstance(tensor, torch.Tensor) and tensor.dim() >= 2:
-                    flat["forward_inputs"][key] = tensor.reshape(-1, *tensor.shape[2:])
+            flat["forward_inputs"] = self._flatten_nested_trajectory_dict(
+                trajectory.forward_inputs
+            )
 
+        return flat
+
+    def _flatten_nested_trajectory_dict(self, data: dict) -> dict:
+        flat: dict[str, object] = {}
+        for key, value in data.items():
+            if isinstance(value, torch.Tensor) and value.dim() >= 2:
+                flat[key] = value.reshape(-1, *value.shape[2:])
+            elif isinstance(value, dict):
+                nested = self._flatten_nested_trajectory_dict(value)
+                if nested:
+                    flat[key] = nested
         return flat
 
     def _extract_chunk_from_flat_trajectory(
@@ -758,50 +764,25 @@ class TrajectoryReplayBuffer:
             if isinstance(value, torch.Tensor):
                 chunk[key] = value[idx]
             elif isinstance(value, dict):
-                nested = {}
-                for nested_key, tensor in value.items():
-                    if isinstance(tensor, torch.Tensor):
-                        nested[nested_key] = tensor[idx]
+                nested = self._extract_chunk_from_flat_trajectory(value, idx)
                 if nested:
                     chunk[key] = nested
         return chunk
 
     def _init_batch_from_flat(self, flat_trajectory: dict, batch_size: int) -> dict:
-        batch: dict[str, object] = {}
-        for key, value in flat_trajectory.items():
-            if isinstance(value, torch.Tensor):
-                shape = (batch_size, *value.shape[1:])
-                batch[key] = torch.empty(shape, dtype=value.dtype, device=value.device)
-            elif isinstance(value, dict):
-                nested_batch = {}
-                for nested_key, nested_value in value.items():
-                    if isinstance(nested_value, torch.Tensor):
-                        shape = (batch_size, *nested_value.shape[1:])
-                        nested_batch[nested_key] = torch.empty(
-                            shape,
-                            dtype=nested_value.dtype,
-                            device=nested_value.device,
-                        )
-                if nested_batch:
-                    batch[key] = nested_batch
-        return batch
+        return self._init_batch_like(flat_trajectory, batch_size)
 
     def _init_batch_from_buffer(self, buffer: dict, batch_size: int) -> dict:
+        return self._init_batch_like(buffer, batch_size)
+
+    def _init_batch_like(self, data: dict, batch_size: int) -> dict:
         batch: dict[str, object] = {}
-        for key, value in buffer.items():
+        for key, value in data.items():
             if isinstance(value, torch.Tensor):
                 shape = (batch_size, *value.shape[1:])
                 batch[key] = torch.empty(shape, dtype=value.dtype, device=value.device)
             elif isinstance(value, dict):
-                nested_batch = {}
-                for nested_key, nested_value in value.items():
-                    if isinstance(nested_value, torch.Tensor):
-                        shape = (batch_size, *nested_value.shape[1:])
-                        nested_batch[nested_key] = torch.empty(
-                            shape,
-                            dtype=nested_value.dtype,
-                            device=nested_value.device,
-                        )
+                nested_batch = self._init_batch_like(value, batch_size)
                 if nested_batch:
                     batch[key] = nested_batch
         return batch
@@ -859,22 +840,7 @@ class TrajectoryReplayBuffer:
                 # Handle nested dicts (obs, forward_inputs)
                 nested_dicts = [chunk[key] for chunk in chunks if key in chunk]
                 if nested_dicts:
-                    all_keys = set()
-                    for d in nested_dicts:
-                        all_keys.update(d.keys())
-
-                    nested_batch = {}
-                    for nested_key in all_keys:
-                        nested_tensors = [
-                            d[nested_key]
-                            for d in nested_dicts
-                            if nested_key in d
-                            and isinstance(d[nested_key], torch.Tensor)
-                        ]
-                        if nested_tensors:
-                            nested_batch[nested_key] = torch.stack(
-                                nested_tensors, dim=0
-                            )  # [B, ...]
+                    nested_batch = self._merge_chunks_to_batch(nested_dicts)
                     if nested_batch:
                         batch[key] = nested_batch
 
