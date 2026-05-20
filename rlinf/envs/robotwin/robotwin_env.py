@@ -14,6 +14,7 @@
 
 import json
 import os
+import time
 from typing import Optional, Union
 
 import gymnasium as gym
@@ -61,6 +62,11 @@ class RoboTwinEnv(gym.Env):
 
         self.task_name = cfg.task_config.task_name
         self.robotwin_action_mode = cfg.get("robotwin_action_mode", "qpos14")
+        self.ee16_execution_strategy = cfg.get(
+            "ee16_execution_strategy",
+            "pointwise",
+        )
+        self._validate_ee16_execution_strategy(self.ee16_execution_strategy)
 
         self.center_crop = cfg.get("center_crop", False)
         self._init_reset_state_ids()
@@ -408,6 +414,23 @@ class RoboTwinEnv(gym.Env):
     def _is_ee16_action_mode(self) -> bool:
         return self.robotwin_action_mode in ("ee16", "endpose16")
 
+    @staticmethod
+    def _validate_ee16_execution_strategy(strategy: str) -> None:
+        if strategy not in ("pointwise", "last_target"):
+            msg = (
+                "RoboTwin ee16 execution strategy must be 'pointwise' or "
+                f"'last_target', got {strategy!r}."
+            )
+            raise ValueError(msg)
+
+    def _select_ee16_execution_indices(self, chunk_step: int) -> list[int]:
+        self._validate_ee16_execution_strategy(self.ee16_execution_strategy)
+        if chunk_step <= 0:
+            raise ValueError("RoboTwin ee16 chunk actions must contain at least one target.")
+        if self.ee16_execution_strategy == "last_target":
+            return [chunk_step - 1]
+        return list(range(chunk_step))
+
     def _validate_ee16_action(self, action: np.ndarray) -> None:
         if action.shape != (self.num_envs, 16):
             msg = (
@@ -448,14 +471,38 @@ class RoboTwinEnv(gym.Env):
     def _step_ee16_action(self, action: np.ndarray, auto_reset=True):
         self._validate_ee16_action(action)
         tasks = self._get_ee16_tasks()
+        step_debug = None
+        if getattr(self, "debug_ee16_timing", False):
+            step_debug = {
+                "take_action_calls": 0,
+                "take_action_times": [],
+                "hold_noop_count": 0,
+                "left_epsilon_count": 0,
+                "right_epsilon_count": 0,
+            }
         for env_id, task in enumerate(tasks):
-            robotwin_action = self._canonical_ee16_xyzw_to_robotwin_wxyz(action[env_id])
+            original_action = np.array(action[env_id], copy=True)
             robotwin_action = self._avoid_robotwin_zero_step_ee_plan(
                 task,
-                robotwin_action,
+                action[env_id],
             )
             if robotwin_action is not None:
+                if step_debug is not None:
+                    left_epsilon = not np.allclose(
+                        robotwin_action[0:7], original_action[0:7], atol=0.0, rtol=0.0
+                    )
+                    right_epsilon = not np.allclose(
+                        robotwin_action[8:15], original_action[8:15], atol=0.0, rtol=0.0
+                    )
+                    step_debug["left_epsilon_count"] += int(left_epsilon)
+                    step_debug["right_epsilon_count"] += int(right_epsilon)
+                    take_start = time.perf_counter()
                 task.take_action(robotwin_action, action_type="ee")
+                if step_debug is not None:
+                    step_debug["take_action_calls"] += 1
+                    step_debug["take_action_times"].append(time.perf_counter() - take_start)
+            elif step_debug is not None:
+                step_debug["hold_noop_count"] += 1
 
         raw_obs = self.venv.get_obs()
         extracted_obs = self._extract_obs_image(raw_obs)
@@ -507,6 +554,9 @@ class RoboTwinEnv(gym.Env):
         if dones.any() and _auto_reset:
             extracted_obs, infos = self._handle_auto_reset(dones, extracted_obs, infos)
 
+        if step_debug is not None:
+            infos["_ee16_step_debug"] = step_debug
+
         return extracted_obs, step_reward, terminations, truncations, infos
 
     def _chunk_step_ee16(self, actions: np.ndarray, auto_reset=True):
@@ -515,11 +565,40 @@ class RoboTwinEnv(gym.Env):
         obs_list = []
         infos_list = []
         chunk_rewards, raw_terms, raw_truncs = [], [], []
+        chunk_debug = None
+        if getattr(self, "debug_ee16_timing", False):
+            chunk_debug = {
+                "chunk_len": int(chunk_step),
+                "execution_strategy": self.ee16_execution_strategy,
+                "selected_target_indices": self._select_ee16_execution_indices(chunk_step),
+                "selected_target_index": None,
+                "take_action_calls": 0,
+                "take_action_times": [],
+                "hold_noop_count": 0,
+                "left_epsilon_count": 0,
+                "right_epsilon_count": 0,
+                "step_times": [],
+                "planner_failure": False,
+            }
 
-        for step_id in range(chunk_step):
+        selected_indices = self._select_ee16_execution_indices(chunk_step)
+        if chunk_debug is not None:
+            chunk_debug["selected_target_index"] = int(selected_indices[-1])
+
+        for step_id in selected_indices:
+            step_start = time.perf_counter()
             obs, reward, terminations, truncations, infos = self._step_ee16_action(
                 actions[:, step_id], auto_reset=False
             )
+            if chunk_debug is not None:
+                chunk_debug["step_times"].append(time.perf_counter() - step_start)
+                step_debug = infos.pop("_ee16_step_debug", None)
+                if step_debug is not None:
+                    chunk_debug["take_action_calls"] += step_debug["take_action_calls"]
+                    chunk_debug["take_action_times"].extend(step_debug["take_action_times"])
+                    chunk_debug["hold_noop_count"] += step_debug["hold_noop_count"]
+                    chunk_debug["left_epsilon_count"] += step_debug["left_epsilon_count"]
+                    chunk_debug["right_epsilon_count"] += step_debug["right_epsilon_count"]
             obs_list.append(obs)
             infos_list.append(infos)
             chunk_rewards.append(reward)
@@ -573,17 +652,9 @@ class RoboTwinEnv(gym.Env):
         chunk_terminations[:, -1] = past_terminations
         chunk_truncations = torch.zeros_like(raw_truncs)
         chunk_truncations[:, -1] = past_truncations
+        if chunk_debug is not None and infos_list:
+            infos_list[-1]["ee16_chunk_debug"] = chunk_debug
         return obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list
-
-    @staticmethod
-    def _canonical_ee16_xyzw_to_robotwin_wxyz(action: np.ndarray) -> np.ndarray:
-        if action.shape != (16,):
-            msg = f"canonical ee16 action must have shape (16,), got {action.shape}."
-            raise ValueError(msg)
-        converted = np.array(action, copy=True)
-        converted[3:7] = action[[6, 3, 4, 5]]
-        converted[11:15] = action[[14, 11, 12, 13]]
-        return converted
 
     @staticmethod
     def _avoid_robotwin_zero_step_ee_plan(task, action: np.ndarray) -> np.ndarray | None:

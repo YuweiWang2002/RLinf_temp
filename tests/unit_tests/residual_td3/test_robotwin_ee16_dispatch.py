@@ -76,6 +76,7 @@ def _env(robotwin_action_mode: str = "qpos14", expose_tasks: bool = True):
     env = object.__new__(RoboTwinEnv)
     env.num_envs = 2
     env.robotwin_action_mode = robotwin_action_mode
+    env.ee16_execution_strategy = "pointwise"
     env.venv = _FakeVenv(env.num_envs, expose_tasks=expose_tasks)
     env.cfg = _Cfg(robotwin_action_mode)
     env.auto_reset = False
@@ -139,10 +140,7 @@ def test_ee16_path_calls_task_take_action_with_ee_action_type():
         action, action_type = task.calls[0]
         assert action.shape == (16,)
         assert action_type == "ee"
-        expected = actions[env_id].copy()
-        expected[3:7] = actions[env_id, [6, 3, 4, 5]]
-        expected[11:15] = actions[env_id, [14, 11, 12, 13]]
-        np.testing.assert_allclose(action, expected)
+        np.testing.assert_allclose(action, actions[env_id])
 
 
 def test_ee16_mode_requires_task_access_and_never_silent_falls_back_to_qpos():
@@ -152,3 +150,51 @@ def test_ee16_mode_requires_task_access_and_never_silent_falls_back_to_qpos():
         env.step(np.zeros((2, 16), dtype=np.float32))
 
     assert env.venv.step_calls == []
+
+
+def test_ee16_pointwise_strategy_executes_all_chunk_targets():
+    env = _env("ee16")
+    env.debug_ee16_timing = True
+    actions = np.arange(2 * 3 * 16, dtype=np.float32).reshape(2, 3, 16)
+
+    _, rewards, _, _, infos_list = env._chunk_step_ee16(actions)
+
+    assert rewards.shape == (2, 3)
+    assert len(infos_list) == 3
+    for env_id, task in enumerate(env.venv.tasks):
+        assert len(task.calls) == 3
+        np.testing.assert_allclose(task.calls[0][0], actions[env_id, 0])
+        np.testing.assert_allclose(task.calls[1][0], actions[env_id, 1])
+        np.testing.assert_allclose(task.calls[2][0], actions[env_id, 2])
+    debug = infos_list[-1]["ee16_chunk_debug"]
+    assert debug["execution_strategy"] == "pointwise"
+    assert debug["selected_target_indices"] == [0, 1, 2]
+    assert debug["take_action_calls"] == 6
+
+
+def test_ee16_last_target_strategy_executes_only_final_chunk_target():
+    env = _env("ee16")
+    env.ee16_execution_strategy = "last_target"
+    env.debug_ee16_timing = True
+    actions = np.arange(2 * 3 * 16, dtype=np.float32).reshape(2, 3, 16)
+
+    obs_list, rewards, _, _, infos_list = env._chunk_step_ee16(actions)
+
+    assert len(obs_list) == 1
+    assert rewards.shape == (2, 3)
+    for env_id, task in enumerate(env.venv.tasks):
+        assert len(task.calls) == 1
+        np.testing.assert_allclose(task.calls[0][0], actions[env_id, -1])
+    debug = infos_list[-1]["ee16_chunk_debug"]
+    assert debug["execution_strategy"] == "last_target"
+    assert debug["selected_target_indices"] == [2]
+    assert debug["selected_target_index"] == 2
+    assert debug["take_action_calls"] == 2
+
+
+def test_ee16_invalid_execution_strategy_raises_value_error():
+    env = _env("ee16")
+    env.ee16_execution_strategy = "bad"
+
+    with pytest.raises(ValueError, match="execution strategy"):
+        env._chunk_step_ee16(np.zeros((2, 3, 16), dtype=np.float32))

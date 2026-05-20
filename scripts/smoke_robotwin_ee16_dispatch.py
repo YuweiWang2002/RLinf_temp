@@ -1,9 +1,7 @@
 """Real RoboTwin smoke test for RLinf ee16 dispatch.
 
-RLinf canonical endpose16 uses xyzw quaternions. RoboTwin's task
-``get_arm_pose`` and ``take_action(action_type="ee")`` use wxyz at the
-task boundary, so this script converts explicitly when building canonical
-RLinf actions from RoboTwin poses.
+RLinf canonical endpose16 uses wxyz quaternions, matching RoboTwin's task
+``get_arm_pose`` and ``take_action(action_type="ee")`` boundary.
 """
 
 from __future__ import annotations
@@ -56,7 +54,7 @@ def main() -> int:
             before = read_dual_pose(task)
             action16 = build_canonical_action16(task, before)
             print_quat_boundary()
-            print_action("action16_canonical_xyzw.before_mode", action16)
+            print_action("action16_canonical_wxyz.before_mode", action16)
 
             if args.mode == "identity":
                 obs, reward, term, trunc, info = env.step(action16.reshape(1, 16))
@@ -74,7 +72,7 @@ def main() -> int:
                 action16 = action16.copy()
                 axis_idx = {"x": 8, "y": 9, "z": 10}[args.axis]
                 action16[axis_idx] += args.delta
-                print_action("action16_canonical_xyzw.delta_mode", action16)
+                print_action("action16_canonical_wxyz.delta_mode", action16)
                 obs, reward, term, trunc, info = env.step(action16.reshape(1, 16))
                 del obs
 
@@ -91,7 +89,7 @@ def main() -> int:
                 print("SMOKE: SUSPICIOUS")
                 print_pose("before", before)
                 print_pose("after", after)
-                print_action("action16_canonical_xyzw", action16)
+                print_action("action16_canonical_wxyz", action16)
                 return 2 if args.strict else 0
             print("SMOKE: PASS")
             return 0
@@ -230,8 +228,6 @@ def read_dual_pose(task: Any) -> dict[str, np.ndarray]:
     left_wxyz = np.asarray(task.get_arm_pose("left"), dtype=np.float64).reshape(7)
     right_wxyz = np.asarray(task.get_arm_pose("right"), dtype=np.float64).reshape(7)
     return {
-        "left_xyzw": pose_wxyz_to_xyzw(left_wxyz),
-        "right_xyzw": pose_wxyz_to_xyzw(right_wxyz),
         "left_wxyz": left_wxyz,
         "right_wxyz": right_wxyz,
     }
@@ -242,9 +238,9 @@ def build_canonical_action16(task: Any, poses: dict[str, np.ndarray]) -> np.ndar
     right_gripper = get_gripper(task, "right")
     return np.concatenate(
         (
-            poses["left_xyzw"],
+            poses["left_wxyz"],
             np.asarray([left_gripper], dtype=np.float64),
-            poses["right_xyzw"],
+            poses["right_wxyz"],
             np.asarray([right_gripper], dtype=np.float64),
         ),
         axis=0,
@@ -262,13 +258,7 @@ def get_gripper(task: Any, side: str) -> float:
     return float(getattr(robot, "right_gripper_val", 0.0))
 
 
-def pose_wxyz_to_xyzw(pose: np.ndarray) -> np.ndarray:
-    converted = np.array(pose, copy=True)
-    converted[3:7] = pose[[4, 5, 6, 3]]
-    return converted
-
-
-def quat_angle_error_xyzw(a_quat: np.ndarray, b_quat: np.ndarray) -> float:
+def quat_angle_error_wxyz(a_quat: np.ndarray, b_quat: np.ndarray) -> float:
     a = a_quat / np.linalg.norm(a_quat)
     b = b_quat / np.linalg.norm(b_quat)
     dot = float(np.clip(abs(np.dot(a, b)), -1.0, 1.0))
@@ -277,10 +267,10 @@ def quat_angle_error_xyzw(a_quat: np.ndarray, b_quat: np.ndarray) -> float:
 
 def summarize(before: dict[str, np.ndarray], after: dict[str, np.ndarray]) -> dict[str, float]:
     return {
-        "left_pos_err": float(np.linalg.norm(after["left_xyzw"][0:3] - before["left_xyzw"][0:3])),
-        "right_pos_err": float(np.linalg.norm(after["right_xyzw"][0:3] - before["right_xyzw"][0:3])),
-        "left_quat_err_rad": quat_angle_error_xyzw(before["left_xyzw"][3:7], after["left_xyzw"][3:7]),
-        "right_quat_err_rad": quat_angle_error_xyzw(before["right_xyzw"][3:7], after["right_xyzw"][3:7]),
+        "left_pos_err": float(np.linalg.norm(after["left_wxyz"][0:3] - before["left_wxyz"][0:3])),
+        "right_pos_err": float(np.linalg.norm(after["right_wxyz"][0:3] - before["right_wxyz"][0:3])),
+        "left_quat_err_rad": quat_angle_error_wxyz(before["left_wxyz"][3:7], after["left_wxyz"][3:7]),
+        "right_quat_err_rad": quat_angle_error_wxyz(before["right_wxyz"][3:7], after["right_wxyz"][3:7]),
     }
 
 
@@ -306,9 +296,8 @@ def print_quat_boundary() -> None:
     print("QUAT ORDER")
     print("----------")
     print("RoboTwin task.get_arm_pose returns [x,y,z,qw,qx,qy,qz] (wxyz).")
-    print("RLinf canonical endpose16 is [x,y,z,qx,qy,qz,qw] (xyzw).")
-    print("This script converts get_arm_pose wxyz -> canonical xyzw.")
-    print("RoboTwinEnv ee16 dispatch converts canonical xyzw -> RoboTwin wxyz.")
+    print("RLinf canonical endpose16 is [x,y,z,qw,qx,qy,qz] (wxyz).")
+    print("No conversion is needed on the default ee16 path.")
 
 
 def print_summary(
@@ -337,17 +326,15 @@ def print_delta_diagnostic(
     after: dict[str, np.ndarray],
 ) -> float:
     axis_idx = {"x": 0, "y": 1, "z": 2}[args.axis]
-    delta = after["right_xyzw"][axis_idx] - before["right_xyzw"][axis_idx]
+    delta = after["right_wxyz"][axis_idx] - before["right_wxyz"][axis_idx]
     print(f"right_{args.axis}_observed_delta={delta:.9g}")
     print(f"right_{args.axis}_requested_delta={args.delta:.9g}")
     return float(delta)
 
 
 def print_pose(label: str, poses: dict[str, np.ndarray]) -> None:
-    print(f"{label}.left_xyzw={format_vec(poses['left_xyzw'])}")
-    print(f"{label}.right_xyzw={format_vec(poses['right_xyzw'])}")
-    print(f"{label}.left_wxyz_raw={format_vec(poses['left_wxyz'])}")
-    print(f"{label}.right_wxyz_raw={format_vec(poses['right_wxyz'])}")
+    print(f"{label}.left_wxyz={format_vec(poses['left_wxyz'])}")
+    print(f"{label}.right_wxyz={format_vec(poses['right_wxyz'])}")
 
 
 def print_action(label: str, action: np.ndarray) -> None:

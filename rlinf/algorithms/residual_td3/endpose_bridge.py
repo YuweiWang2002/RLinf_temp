@@ -35,9 +35,9 @@ class EndposeBridgeMode(str, Enum):
 class EndposeBridgeSpec:
     """Configuration for building canonical RoboTwin endpose16 chunks.
 
-    Canonical ``robotwin_endpose16`` uses xyzw quaternions:
-    ``[left xyz3, left quat_xyzw4, left gripper1,
-    right xyz3, right quat_xyzw4, right gripper1]``.
+    Canonical ``robotwin_endpose16`` uses wxyz quaternions:
+    ``[left xyz3, left quat_wxyz4, left gripper1,
+    right xyz3, right quat_wxyz4, right gripper1]``.
     """
 
     mode: EndposeBridgeMode
@@ -48,7 +48,7 @@ class EndposeBridgeSpec:
     residual_chunk_len: int = 1
     env_action_chunk_len: Optional[int] = None
     right_xyz_indices: tuple[int, int, int] = (8, 9, 10)
-    quat_order: str = "xyzw"
+    quat_order: str = "wxyz"
     require_current_ee_pose: bool = False
     allow_unimplemented_bridge: bool = False
 
@@ -105,8 +105,8 @@ class EndposeBridge:
             raise ValueError("output_action_space must be 'robotwin_endpose16'.")
         if spec.output_action_dim != 16:
             raise ValueError("output_action_dim must be 16.")
-        if spec.quat_order != "xyzw":
-            raise ValueError("quat_order must be 'xyzw'.")
+        if spec.quat_order != "wxyz":
+            raise ValueError("quat_order must be 'wxyz'.")
         if spec.right_xyz_indices != (8, 9, 10):
             raise ValueError("right_xyz_indices must be (8, 9, 10).")
         if spec.residual_chunk_len <= 0:
@@ -165,12 +165,12 @@ class EndposeBridge:
             raise ValueError("CURRENT_STATE_EE_POSE requires obs.")
         batch_size = base_action_chunk.shape[0]
         left_pos = _require_obs_tensor(obs, "left_ee_pos", batch_size, 3)
-        left_quat = _require_obs_tensor(obs, "left_ee_quat_xyzw", batch_size, 4)
+        left_quat = _require_obs_tensor(obs, "left_ee_quat_wxyz", batch_size, 4)
         left_gripper = normalize_gripper_column(
             require_obs_tensor(obs, "left_gripper")
         )
         right_pos = _require_obs_tensor(obs, "right_ee_pos", batch_size, 3)
-        right_quat = _require_obs_tensor(obs, "right_ee_quat_xyzw", batch_size, 4)
+        right_quat = _require_obs_tensor(obs, "right_ee_quat_wxyz", batch_size, 4)
         right_gripper = normalize_gripper_column(
             require_obs_tensor(obs, "right_gripper")
         )

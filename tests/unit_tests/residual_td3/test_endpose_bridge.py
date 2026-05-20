@@ -43,8 +43,8 @@ def _obs(batch_size: int) -> dict[str, torch.Tensor]:
         "left_ee_pos": torch.arange(batch_size * 3, dtype=torch.float32).reshape(
             batch_size, 3
         ),
-        "left_ee_quat_xyzw": torch.tensor(
-            [[0.0, 0.0, 0.0, 1.0]] * batch_size,
+        "left_ee_quat_wxyz": torch.tensor(
+            [[1.0, 0.0, 0.0, 0.0]] * batch_size,
             dtype=torch.float32,
         ),
         "left_gripper": torch.arange(batch_size, dtype=torch.float32),
@@ -53,8 +53,8 @@ def _obs(batch_size: int) -> dict[str, torch.Tensor]:
             batch_size * 6,
             dtype=torch.float32,
         ).reshape(batch_size, 3),
-        "right_ee_quat_xyzw": torch.tensor(
-            [[0.0, 0.0, 1.0, 0.0]] * batch_size,
+        "right_ee_quat_wxyz": torch.tensor(
+            [[0.0, 0.0, 0.0, 1.0]] * batch_size,
             dtype=torch.float32,
         ),
         "right_gripper": torch.arange(batch_size, dtype=torch.float32).reshape(
@@ -107,13 +107,13 @@ def test_current_state_ee_pose_repeats_current_pose_as_endpose16():
     torch.testing.assert_close(out[..., 0:3], obs["left_ee_pos"][:, None, :].repeat(1, 5, 1))
     torch.testing.assert_close(
         out[..., 3:7],
-        obs["left_ee_quat_xyzw"][:, None, :].repeat(1, 5, 1),
+        obs["left_ee_quat_wxyz"][:, None, :].repeat(1, 5, 1),
     )
     torch.testing.assert_close(out[..., 7], obs["left_gripper"][:, None].repeat(1, 5))
     torch.testing.assert_close(out[..., 8:11], obs["right_ee_pos"][:, None, :].repeat(1, 5, 1))
     torch.testing.assert_close(
         out[..., 11:15],
-        obs["right_ee_quat_xyzw"][:, None, :].repeat(1, 5, 1),
+        obs["right_ee_quat_wxyz"][:, None, :].repeat(1, 5, 1),
     )
     torch.testing.assert_close(
         out[..., 15],
@@ -121,7 +121,7 @@ def test_current_state_ee_pose_repeats_current_pose_as_endpose16():
     )
 
 
-@pytest.mark.parametrize("missing_key", ["left_ee_quat_xyzw", "right_ee_pos"])
+@pytest.mark.parametrize("missing_key", ["left_ee_quat_wxyz", "right_ee_pos"])
 def test_current_state_ee_pose_missing_field_raises(missing_key: str):
     obs = _obs(batch_size=2)
     obs.pop(missing_key)
@@ -189,6 +189,8 @@ def test_endpose_bridge_integrates_with_residual_ref_extraction():
 
 
 def test_quat_order_helpers_convert_xyzw_and_wxyz():
+    # Conversion helpers are retained for explicit future boundaries only;
+    # the default robotwin_endpose16 canonical order is wxyz.
     q_xyzw = torch.tensor([[1.0, 2.0, 3.0, 4.0]])
 
     q_wxyz = xyzw_to_wxyz(q_xyzw)
