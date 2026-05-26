@@ -34,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--feature-batch-size", type=int, default=None)
+    parser.add_argument("--model-num-action-chunks", type=int, default=None)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--feature-source", choices=("action_head_hidden", "prefix_mean"), default="action_head_hidden")
     parser.add_argument("--train-ratio", type=float, default=0.9)
@@ -72,6 +73,7 @@ def main() -> int:
         config_name=args.pi05_config,
         device=args.device,
         norm_stats_path=args.norm_stats_path,
+        model_num_action_chunks=args.model_num_action_chunks,
     )
 
     train = extract_split(
@@ -101,8 +103,10 @@ def main() -> int:
     config = {
         "pi05_config": args.pi05_config,
         "pi05_checkpoint": args.pi05_checkpoint,
+        "norm_stats_path": args.norm_stats_path,
         "feature_source": args.feature_source,
         "z_dim": z_dim,
+        "model_action_chunk": int(model.config.action_chunk),
         "dataset_dir": str(dataset_dir),
         "train_episode_indices": sorted(train_eps),
         "val_episode_indices": sorted(val_eps),
@@ -123,6 +127,7 @@ def load_pi05_model(
     config_name: str,
     device: str,
     norm_stats_path: str | None,
+    model_num_action_chunks: int | None,
 ) -> Any:
     from omegaconf import OmegaConf
 
@@ -136,6 +141,9 @@ def load_pi05_model(
     cfg.model_path = str(model_path)
     cfg.action_dim = 14
     cfg.openpi.config_name = config_name
+    if model_num_action_chunks is not None:
+        cfg.num_action_chunks = model_num_action_chunks
+        cfg.openpi.action_chunk = model_num_action_chunks
     if norm_stats_path:
         cfg.norm_stats_path = norm_stats_path
     else:

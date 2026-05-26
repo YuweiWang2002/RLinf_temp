@@ -542,6 +542,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         env_obs,
         mode: Literal["train", "eval"] = "train",
         compute_values=True,
+        return_action_head_hidden: bool = False,
+        action_head_hidden_chunk_len: int | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
         to_process_obs = self.obs_processor(env_obs)  # env obs -> policy input obs
@@ -570,6 +572,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 noise=noise_actions,
                 mode="eval",
                 compute_values=compute_values,
+                return_action_head_hidden=return_action_head_hidden,
+                action_head_hidden_chunk_len=action_head_hidden_chunk_len,
             )
 
             # Step 3: Extract actual actions for environment interaction
@@ -586,7 +590,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         else:
             # Non-DSRL or eval mode
             outputs = self.sample_actions(
-                observation, mode=mode, compute_values=compute_values
+                observation,
+                mode=mode,
+                compute_values=compute_values,
+                return_action_head_hidden=return_action_head_hidden,
+                action_head_hidden_chunk_len=action_head_hidden_chunk_len,
             )
             actions = self.output_transform(
                 {"actions": outputs["actions"], "state": observation.state}
@@ -629,6 +637,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "prev_values": prev_values,
             "forward_inputs": forward_inputs,
         }
+        if return_action_head_hidden:
+            result["action_head_hidden"] = outputs["action_head_hidden"]
         return actions, result
 
     @torch.no_grad()
@@ -638,6 +648,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         noise=None,
         mode="train",
         compute_values=True,
+        return_action_head_hidden: bool = False,
+        action_head_hidden_chunk_len: int | None = None,
     ) -> torch.Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
         bsize = observation.state.shape[0]
@@ -657,6 +669,39 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         prefix_output, prefix_pad_masks, past_key_values = self._build_prefix_cache(
             images, img_masks, lang_tokens, lang_masks
         )
+
+        action_head_hidden = None
+        if return_action_head_hidden:
+            hidden_chunk_len = (
+                self.config.action_chunk
+                if action_head_hidden_chunk_len is None
+                else int(action_head_hidden_chunk_len)
+            )
+            if hidden_chunk_len <= 0 or hidden_chunk_len > self.config.action_horizon:
+                raise ValueError(
+                    "action_head_hidden_chunk_len must be in "
+                    f"[1, {self.config.action_horizon}], got {hidden_chunk_len}."
+                )
+            zero_action = torch.zeros(
+                bsize,
+                self.config.action_horizon,
+                self.config.action_dim,
+                device=device,
+                dtype=self.action_in_proj.weight.dtype,
+            )
+            midpoint_timestep = torch.full(
+                (bsize,),
+                0.5,
+                device=device,
+                dtype=torch.float32,
+            )
+            action_head_hidden = self.get_suffix_out(
+                state,
+                prefix_pad_masks,
+                past_key_values,
+                zero_action,
+                midpoint_timestep,
+            )[:, :hidden_chunk_len].mean(dim=1)
 
         x_t = noise
         # add sde sample and traj collect
@@ -767,6 +812,9 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "prev_values": values,
             "denoise_inds": denoise_inds,
         }
+        if return_action_head_hidden:
+            result["action_head_hidden"] = action_head_hidden
+            result["action_head_hidden_chunk_len"] = hidden_chunk_len
         if collect_nft_traces:
             result.update(
                 {

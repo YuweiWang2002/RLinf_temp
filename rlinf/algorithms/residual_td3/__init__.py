@@ -30,6 +30,14 @@ from .endpose_bridge import (
     xyzw_to_wxyz,
 )
 from .fk_bridge import AlohaFKBridge, AlohaFKBridgeConfig
+from .residual_actor import ResidualActorConfig, ZeroInitResidualActorMLP
+from .residual_ee_intervention import (
+    ConstantResidualActor,
+    ResidualEEInterventionConfig,
+    ResidualEEInterventionRunner,
+    ZeroInitResidualActor,
+    ZeroResidualActor,
+)
 from .schema import (
     ExpertResidualSample,
     ResidualBaseActionSpace,
@@ -43,6 +51,7 @@ __all__ = [
     "ExpertResidualSample",
     "ResidualActionAdapter",
     "ResidualActionSpec",
+    "ResidualActorConfig",
     "ResidualBaseActionSpace",
     "EndposeBridge",
     "EndposeBridgeMode",
@@ -52,10 +61,16 @@ __all__ = [
     "EndposeActionPipelineOutput",
     "AlohaFKBridge",
     "AlohaFKBridgeConfig",
+    "ConstantResidualActor",
+    "ResidualEEInterventionConfig",
+    "ResidualEEInterventionRunner",
     "ResidualFrame",
     "ResidualMode",
     "ResidualObs",
     "ResidualTransition",
+    "ZeroInitResidualActor",
+    "ZeroInitResidualActorMLP",
+    "ZeroResidualActor",
     "build_residual_action_spec",
     "normalize_gripper_column",
     "require_obs_tensor",
