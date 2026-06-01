@@ -31,12 +31,30 @@ from .endpose_bridge import (
 )
 from .fk_bridge import AlohaFKBridge, AlohaFKBridgeConfig
 from .residual_actor import ResidualActorConfig, ZeroInitResidualActorMLP
+from .residual_bc_dataset import ResidualBCTargetBuilder, ResidualBCTargetConfig
+from .residual_bc_training import (
+    ResidualBCDatasetConfig,
+    ResidualBCNpzDataset,
+    build_residual_actor_obs_features,
+    build_residual_actor_obs_features_from_endpose,
+    residual_actor_obs_features_to_tensor,
+    split_by_episode,
+)
 from .residual_ee_intervention import (
+    BCResidualActor,
     ConstantResidualActor,
+    RandomNoiseResidualActor,
     ResidualEEInterventionConfig,
     ResidualEEInterventionRunner,
     ZeroInitResidualActor,
     ZeroResidualActor,
+)
+from .residual_replay import (
+    ReplayRewardConfig,
+    build_replay_from_rollout,
+    episode_reward,
+    load_baseline_success_by_seed,
+    save_replay_artifacts,
 )
 from .schema import (
     ExpertResidualSample,
@@ -52,7 +70,13 @@ __all__ = [
     "ResidualActionAdapter",
     "ResidualActionSpec",
     "ResidualActorConfig",
+    "ResidualBCTargetBuilder",
+    "ResidualBCTargetConfig",
+    "ResidualBCDatasetConfig",
+    "ResidualBCNpzDataset",
     "ResidualBaseActionSpace",
+    "build_residual_actor_obs_features",
+    "build_residual_actor_obs_features_from_endpose",
     "EndposeBridge",
     "EndposeBridgeMode",
     "EndposeBridgeSpec",
@@ -61,7 +85,10 @@ __all__ = [
     "EndposeActionPipelineOutput",
     "AlohaFKBridge",
     "AlohaFKBridgeConfig",
+    "BCResidualActor",
     "ConstantResidualActor",
+    "RandomNoiseResidualActor",
+    "ReplayRewardConfig",
     "ResidualEEInterventionConfig",
     "ResidualEEInterventionRunner",
     "ResidualFrame",
@@ -72,8 +99,14 @@ __all__ = [
     "ZeroInitResidualActorMLP",
     "ZeroResidualActor",
     "build_residual_action_spec",
+    "build_replay_from_rollout",
+    "episode_reward",
+    "load_baseline_success_by_seed",
     "normalize_gripper_column",
+    "residual_actor_obs_features_to_tensor",
     "require_obs_tensor",
+    "save_replay_artifacts",
+    "split_by_episode",
     "validate_residual_td3_cfg",
     "wxyz_to_xyzw",
     "xyzw_to_wxyz",

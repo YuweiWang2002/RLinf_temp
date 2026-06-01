@@ -11,6 +11,7 @@ import time
 import traceback
 from copy import deepcopy
 from pathlib import Path
+from pkgutil import extend_path
 from typing import Any
 
 import numpy as np
@@ -22,6 +23,9 @@ DEFAULT_NORM_STATS = (
     "/nfs/data3/piNFT/checkpoints/pi05_aloha_robotwin_handover/"
     "pi05_base/19999/assets/handover_expert/norm_stats.json"
 )
+DEFAULT_ROBOTWIN_CUROBO_SRC = "/home/user/RoboTwin/envs/curobo/src"
+DEFAULT_JS4_ROBOTWIN_TEMP = "/tmp/tmp_w6y6w0rl/RoboTwin"
+DEFAULT_JS4_ROBOTWIN_ASSETS = "/tmp/tmp_w6y6w0rl/RoboTwin/assets"
 
 
 def parse_args() -> argparse.Namespace:
@@ -67,14 +71,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--planner-backend", choices=("curobo", "mplib"), default="curobo")
     parser.add_argument("--debug-ee16-timing", action="store_true")
     parser.add_argument("--debug-action-smoothness", action="store_true")
+    parser.add_argument(
+        "--robotwin-runtime-bootstrap",
+        choices=("auto", "none"),
+        default="auto",
+        help="Auto-configure RoboTwin/curobo import paths for remote eval environments such as JS4.",
+    )
+    parser.add_argument(
+        "--robotwin-path",
+        default=None,
+        help="Optional explicit RoboTwin repo path. Defaults to ROBOTWIN_PATH or known remote paths.",
+    )
+    parser.add_argument(
+        "--curobo-src-path",
+        default=None,
+        help="Optional explicit curobo source path to prepend to PYTHONPATH.",
+    )
+    parser.add_argument(
+        "--robotwin-assets-path",
+        default=None,
+        help="Optional explicit RoboTwin assets directory. Defaults to ROBOTWIN_ASSETS_PATH or known remote paths.",
+    )
+    parser.add_argument(
+        "--robotwin-setup-max-retries",
+        type=int,
+        default=8,
+        help="Fail fast if RoboTwin setup_demo keeps failing instead of retrying forever silently.",
+    )
+    parser.add_argument("--strict-startup-debug", action="store_true")
     parser.add_argument("--strict", action="store_true")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    configure_line_buffering()
     if args.cuda_visible_devices is not None:
         os.environ["CUDA_VISIBLE_DEVICES"] = args.cuda_visible_devices
+    bootstrap_robotwin_runtime(args)
     print_context(args)
 
     env = None
@@ -506,6 +540,10 @@ def load_env_cfg(args: argparse.Namespace) -> Any:
     OmegaConf.set_struct(env_cfg, False)
     if args.task_name is not None:
         env_cfg.task_config.task_name = args.task_name
+    env_cfg.assets_path = normalize_robotwin_assets_path(
+        configured_assets_path=getattr(env_cfg, "assets_path", None),
+        explicit_assets_path=getattr(args, "robotwin_assets_path", None),
+    )
     env_cfg.total_num_envs = 1
     env_cfg.seed = args.seed
     env_cfg.auto_reset = False
@@ -617,6 +655,7 @@ def install_norm_stats_fallback(action_dim: int) -> None:
 
 def make_env(env_cfg: Any) -> Any:
     ensure_robotwin_vector_env_importable()
+    patch_robotwin_vector_env_debugging()
     from rlinf.envs.robotwin.robotwin_env import RoboTwinEnv
 
     env = RoboTwinEnv(
@@ -632,16 +671,21 @@ def make_env(env_cfg: Any) -> Any:
 
 
 def ensure_robotwin_vector_env_importable() -> None:
+    robotwin_path = os.environ.get("ROBOTWIN_PATH")
+    cwd = os.getcwd()
     try:
+        if robotwin_path:
+            os.chdir(robotwin_path)
         importlib.import_module("robotwin.envs.vector_env")
         return
     except ModuleNotFoundError:
         pass
+    finally:
+        os.chdir(cwd)
 
-    robotwin_path = os.environ.get("ROBOTWIN_PATH")
     if not robotwin_path:
         raise
-    cwd = os.getcwd()
+    _extend_envs_namespace_if_needed(robotwin_path)
     try:
         os.chdir(robotwin_path)
         compat_mod = importlib.import_module("envs.vector_env")
@@ -651,6 +695,214 @@ def ensure_robotwin_vector_env_importable() -> None:
     sys.modules["robotwin.envs.vector_env"] = compat_mod
     setattr(robotwin_envs, "vector_env", compat_mod)
     print("IMPORT COMPAT: mapped envs.vector_env -> robotwin.envs.vector_env")
+
+
+def bootstrap_robotwin_runtime(args: argparse.Namespace) -> None:
+    """Best-effort runtime bootstrap for RoboTwin remote evaluation hosts."""
+
+    if getattr(args, "robotwin_runtime_bootstrap", "auto") == "none":
+        return
+    repo_root = Path(os.environ.get("REPO_PATH", Path.cwd())).resolve()
+    robotwin_candidates = [
+        getattr(args, "robotwin_path", None),
+        os.environ.get("ROBOTWIN_PATH"),
+        str(repo_root.parent / "RoboTwin"),
+        DEFAULT_JS4_ROBOTWIN_TEMP,
+        "/home/user/RoboTwin",
+    ]
+    resolved_robotwin = first_existing_dir(robotwin_candidates)
+    if resolved_robotwin is not None:
+        os.environ["ROBOTWIN_PATH"] = resolved_robotwin
+    resolved_assets = resolve_robotwin_assets_path(
+        explicit_assets_path=getattr(args, "robotwin_assets_path", None),
+        robotwin_root=resolved_robotwin,
+    )
+    if resolved_assets is not None:
+        os.environ["ROBOTWIN_ASSETS_PATH"] = resolved_assets
+    if hasattr(args, "robotwin_setup_max_retries"):
+        os.environ["RLINF_ROBOTWIN_SETUP_MAX_RETRIES"] = str(args.robotwin_setup_max_retries)
+    py_candidates = [
+        getattr(args, "curobo_src_path", None),
+        os.path.join("/home/user/RoboTwin", "envs", "curobo", "src"),
+        os.path.join(DEFAULT_JS4_ROBOTWIN_TEMP, "envs", "curobo", "src"),
+        str(repo_root),
+    ]
+    if resolved_robotwin is not None:
+        py_candidates.extend(
+            [
+                resolved_robotwin,
+                os.path.join(resolved_robotwin, "robotwin"),
+            ]
+        )
+    prepend_pythonpath(py_candidates)
+    if os.path.exists("/etc/vulkan/icd.d/nvidia_icd.json"):
+        os.environ.setdefault("VK_ICD_FILENAMES", "/etc/vulkan/icd.d/nvidia_icd.json")
+    os.environ.setdefault("VK_LAYER_PATH", "")
+    os.environ.setdefault("DISPLAY", "")
+
+
+def prepend_pythonpath(paths: list[str | None]) -> None:
+    existing = [entry for entry in os.environ.get("PYTHONPATH", "").split(os.pathsep) if entry]
+    ordered = []
+    seen = set(existing)
+    for path in paths:
+        if not path:
+            continue
+        normalized = str(Path(path).resolve())
+        if not Path(normalized).exists() or normalized in seen:
+            continue
+        ordered.append(normalized)
+        seen.add(normalized)
+    os.environ["PYTHONPATH"] = os.pathsep.join([*ordered, *existing])
+    for path in reversed(ordered):
+        if path not in sys.path:
+            sys.path.insert(0, path)
+
+
+def first_existing_dir(candidates: list[str | None]) -> str | None:
+    for candidate in candidates:
+        if candidate and Path(candidate).is_dir():
+            return str(Path(candidate).resolve())
+    return None
+
+
+def resolve_robotwin_assets_path(
+    explicit_assets_path: str | None,
+    robotwin_root: str | None,
+) -> str | None:
+    candidates = [
+        explicit_assets_path,
+        os.environ.get("ROBOTWIN_ASSETS_PATH"),
+        DEFAULT_JS4_ROBOTWIN_ASSETS,
+    ]
+    if robotwin_root is not None:
+        candidates.append(str(Path(robotwin_root) / "assets"))
+    resolved = first_existing_dir(candidates)
+    if resolved is None:
+        return None
+    return canonicalize_robotwin_assets_root(resolved)
+
+
+def normalize_robotwin_assets_path(
+    configured_assets_path: str | None,
+    explicit_assets_path: str | None = None,
+) -> str:
+    candidate = resolve_robotwin_assets_path(
+        explicit_assets_path=explicit_assets_path,
+        robotwin_root=os.environ.get("ROBOTWIN_PATH"),
+    )
+    if candidate is None and configured_assets_path:
+        configured_path = Path(str(configured_assets_path)).resolve()
+        if configured_path.is_dir():
+            candidate = canonicalize_robotwin_assets_root(str(configured_path))
+    if candidate is None:
+        raise FileNotFoundError(
+            "Could not resolve RoboTwin assets path. Pass --robotwin-assets-path or set "
+            "ROBOTWIN_ASSETS_PATH, for example /tmp/tmp_w6y6w0rl/RoboTwin/assets."
+        )
+    return str(Path(candidate).resolve())
+
+
+def canonicalize_robotwin_assets_root(path_str: str) -> str:
+    """Normalize user-facing assets paths to RoboTwin's expected root directory."""
+
+    path = Path(path_str).resolve()
+    if path.name == "assets":
+        embodiments_dir = path / "embodiments"
+        if embodiments_dir.is_dir():
+            return str(path.parent.resolve())
+    assets_child = path / "assets"
+    if assets_child.is_dir():
+        return str(path.resolve())
+    return str(path.resolve())
+
+
+def _extend_envs_namespace_if_needed(robotwin_path: str) -> None:
+    """Allow `envs` to resolve across RoboTwin's split env directories."""
+
+    import envs
+
+    robotwin_envs = Path(robotwin_path) / "robotwin" / "envs"
+    envs.__path__ = extend_path(list(envs.__path__), envs.__name__)
+    envs_paths = [str(Path(path).resolve()) for path in envs.__path__]
+    candidate = str(robotwin_envs.resolve())
+    if robotwin_envs.is_dir() and candidate not in envs_paths:
+        envs.__path__.append(candidate)
+        print(f"IMPORT COMPAT: extended envs.__path__ with {candidate}")
+
+
+def patch_robotwin_vector_env_debugging() -> None:
+    """Patch RoboTwin's silent retry loops so startup failures become visible."""
+
+    vector_env = importlib.import_module("robotwin.envs.vector_env")
+    if getattr(vector_env, "_rlinf_debug_patch_applied", False):
+        return
+
+    max_retries = int(os.environ.get("RLINF_ROBOTWIN_SETUP_MAX_RETRIES", "8"))
+    class_decorator = vector_env.class_decorator
+
+    def setup_task_with_debug(self):
+        self.close()
+        self.task = class_decorator(self.task_name)
+        trial_seed = self.env_seed
+        retries = 0
+        while retries < max_retries:
+            task = None
+            retry_message = None
+            with self.global_lock:
+                with self.lock:
+                    try:
+                        print(
+                            f"ROBOTWIN SETUP_TASK TRY: env_id={self.env_id} seed={trial_seed} retry={retries}",
+                            flush=True,
+                        )
+                        task = class_decorator(self.task_name)
+                        task.setup_demo(
+                            now_ep_num=trial_seed,
+                            seed=trial_seed,
+                            is_test=True,
+                            **self.args,
+                        )
+                        episode_info = task.get_info()
+                        self.episode_info_list = [episode_info]
+                        task.close_env()
+                        print(
+                            f"ROBOTWIN SETUP_TASK OK: env_id={self.env_id} seed={trial_seed}",
+                            flush=True,
+                        )
+                        return
+                    except Exception as exc:  # noqa: BLE001
+                        retries += 1
+                        if task is not None:
+                            try:
+                                task.close_env(clear_cache=True)
+                            except Exception:
+                                pass
+                        retry_message = (
+                            f"ROBOTWIN SETUP_TASK RETRY: env_id={self.env_id} seed={trial_seed} "
+                            f"retry={retries} exc={type(exc).__name__}: {exc}"
+                        )
+                        trial_seed += 1
+                        self.env_seed = trial_seed
+                        if retries >= max_retries:
+                            raise RuntimeError(
+                                f"RoboTwin SubEnv.setup_task exceeded {max_retries} retries "
+                                f"for env_id={self.env_id}, last_seed={trial_seed - 1}"
+                            ) from exc
+            if retry_message is not None:
+                print(retry_message, flush=True)
+
+    vector_env.SubEnv.setup_task = setup_task_with_debug
+    vector_env._rlinf_debug_patch_applied = True
+
+
+def configure_line_buffering() -> None:
+    """Ensure stdout/stderr stay visible under tee/pipes."""
+
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            reconfigure(line_buffering=True)
 
 
 def get_single_task_after_reset(env: Any) -> Any:
@@ -758,7 +1010,7 @@ def print_context(args: argparse.Namespace) -> None:
     print("---------------")
     for key, value in vars(args).items():
         print(f"{key}={value}")
-    for name in ("REPO_PATH", "ROBOTWIN_PATH", "ROBOT_PLATFORM", "CUDA_VISIBLE_DEVICES"):
+    for name in ("REPO_PATH", "ROBOTWIN_PATH", "ROBOTWIN_ASSETS_PATH", "ROBOT_PLATFORM", "CUDA_VISIBLE_DEVICES"):
         print(f"{name}={os.environ.get(name, '<unset>')}")
 
 

@@ -18,7 +18,9 @@ import torch
 from rlinf.algorithms.residual_td3.fk_bridge import AlohaFKBridge
 from rlinf.algorithms.residual_td3.gate_head import ChunkAwareGateRuntime
 from rlinf.algorithms.residual_td3.residual_ee_intervention import (
+    BCResidualActor,
     ConstantResidualActor,
+    RandomNoiseResidualActor,
     ResidualEEInterventionConfig,
     ResidualEEInterventionRunner,
     ZeroInitResidualActor,
@@ -29,8 +31,10 @@ from scripts.rollout_pi05_fk_ee16_zero_residual import (
 )
 from scripts.rollout_pi05_fk_ee16_zero_residual import (
     append_frame,
+    bootstrap_robotwin_runtime,
     build_actor_model_cfg,
     close_env,
+    configure_line_buffering,
     get_single_task,
     load_env_cfg,
     load_model,
@@ -83,10 +87,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--residual-actor",
         "--residual_actor",
+        "--residual-actor-type",
         dest="residual_actor",
-        choices=("zero", "constant", "zero_init"),
+        choices=("zero", "constant", "zero_init", "bc", "random_noise"),
         default="zero",
     )
+    parser.add_argument("--residual-actor-checkpoint", default=None)
+    parser.add_argument("--residual-dry-run", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--residual-scale", type=float, default=1.0)
+    parser.add_argument("--residual-noise-std", type=float, default=0.001)
+    parser.add_argument("--log-bc-residual-predictions", action="store_true")
+    parser.add_argument("--enable-learned-residual-control", action="store_true")
     parser.add_argument(
         "--residual-constant-delta-local-xyz",
         "--residual_constant_delta_local_xyz",
@@ -95,7 +106,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=(0.0, 0.0, 0.0),
     )
-    parser.add_argument("--residual-horizon-k", "--residual_horizon_k", dest="residual_horizon_k", type=int, default=5)
+    parser.add_argument("--residual-horizon-k", "--residual_horizon_k", dest="residual_horizon_k", type=int, default=10)
     parser.add_argument(
         "--residual-target-horizon-offset",
         "--residual_target_horizon_offset",
@@ -108,7 +119,7 @@ def parse_args() -> argparse.Namespace:
         "--residual_max_delta_local_xyz",
         dest="residual_max_delta_local_xyz",
         type=float,
-        default=0.02,
+        default=0.05,
     )
     parser.add_argument(
         "--left-stabilization-mode",
@@ -169,12 +180,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-images-in-input", type=int, default=3)
     parser.add_argument("--noise-level", type=float, default=0.3)
     parser.add_argument("--planner-backend", choices=("curobo", "mplib"), default="curobo")
+    parser.add_argument(
+        "--robotwin-runtime-bootstrap",
+        choices=("auto", "none"),
+        default="auto",
+        help="Auto-configure RoboTwin/curobo import paths for remote eval environments such as JS4.",
+    )
+    parser.add_argument("--robotwin-path", default=None)
+    parser.add_argument("--curobo-src-path", default=None)
+    parser.add_argument("--robotwin-assets-path", default=None)
+    parser.add_argument("--robotwin-setup-max-retries", type=int, default=8)
     parser.add_argument("--debug-ee16-timing", action="store_true")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+    configure_line_buffering()
+    bootstrap_robotwin_runtime(args)
+    validate_residual_control_args(args)
     print_context(args)
     env = None
     try:
@@ -224,6 +248,7 @@ def build_env_args(args: argparse.Namespace) -> SimpleNamespace:
         save_dir=args.save_dir,
         data_dir=str(Path(args.save_dir) / "data"),
         execution_mode="qpos14",
+        robotwin_assets_path=args.robotwin_assets_path,
     )
 
 
@@ -259,8 +284,19 @@ def build_intervention_runner(task: Any, args: argparse.Namespace) -> ResidualEE
             delta_max=args.residual_max_delta_local_xyz,
             device=args.device,
         )
+    elif args.residual_actor == "bc":
+        if not args.residual_actor_checkpoint:
+            raise ValueError("--residual-actor-checkpoint is required for --residual-actor bc.")
+        actor = BCResidualActor.load_from_checkpoint(args.residual_actor_checkpoint, device=args.device)
+    elif args.residual_actor == "random_noise":
+        actor = RandomNoiseResidualActor(
+            noise_std=args.residual_noise_std,
+            max_delta_local_xyz=args.residual_max_delta_local_xyz,
+            seed=args.seed,
+        )
     else:
         actor = ConstantResidualActor(tuple(float(v) for v in args.residual_constant_delta_local_xyz))
+    control_flags = resolve_residual_control_flags(args)
     cfg = ResidualEEInterventionConfig(
         horizon_k=args.residual_horizon_k,
         target_horizon_offset=args.residual_target_horizon_offset,
@@ -268,6 +304,9 @@ def build_intervention_runner(task: Any, args: argparse.Namespace) -> ResidualEE
         left_stabilization_mode=args.left_stabilization_mode,
         left_deadband_xyz=args.left_deadband_xyz,
         left_lowpass_alpha=args.left_lowpass_alpha,
+        residual_scale=args.residual_scale,
+        dry_run=control_flags["dry_run"],
+        learned_residual_control_enabled=control_flags["learned_residual_control_enabled"],
     )
     return ResidualEEInterventionRunner(
         AlohaFKBridge.from_robotwin_task(task, device=args.device),
@@ -306,6 +345,10 @@ def run_episodes(
         "chunk_aware_gate_checkpoint": args.chunk_aware_gate_checkpoint,
         "enable_residual_intervention": bool(args.enable_residual_intervention),
         "residual_actor": args.residual_actor,
+        "residual_actor_checkpoint": args.residual_actor_checkpoint,
+        "residual_dry_run": resolve_residual_dry_run(args),
+        "residual_scale": args.residual_scale,
+        "enable_learned_residual_control": learned_residual_control_enabled(args),
         "residual_horizon_k": args.residual_horizon_k,
         "residual_target_horizon_offset": args.residual_target_horizon_offset,
         "residual_max_delta_local_xyz": args.residual_max_delta_local_xyz,
@@ -461,6 +504,7 @@ def run_episode(
         )
 
     probs = np.asarray([row["gate_prob"] for row in rows], dtype=np.float32)
+    residual_stats = residual_prediction_stats(intervention_records)
     summary = {
         "episode_id": episode_id,
         "seed": seed,
@@ -476,6 +520,26 @@ def run_episode(
         "first_intervention_step": first_intervention(rows, field="env_step_start"),
         "num_interventions": sum(1 for row in rows if row["execution_mode"] == "ee16_zero_residual"),
         "total_ee_intervention_steps": int(sum(row["num_intervention_steps"] for row in rows)),
+        "pred_norm_mean": residual_stats["pred_norm_mean"],
+        "pred_norm_std": residual_stats["pred_norm_std"],
+        "pred_norm_max": residual_stats["pred_norm_max"],
+        "pred_norm_p50": residual_stats["pred_norm_p50"],
+        "pred_norm_p90": residual_stats["pred_norm_p90"],
+        "pred_norm_p95": residual_stats["pred_norm_p95"],
+        "pred_norm_p99": residual_stats["pred_norm_p99"],
+        "applied_norm_mean": residual_stats["applied_norm_mean"],
+        "applied_norm_std": residual_stats["applied_norm_std"],
+        "applied_norm_max": residual_stats["applied_norm_max"],
+        "applied_norm_p50": residual_stats["applied_norm_p50"],
+        "applied_norm_p90": residual_stats["applied_norm_p90"],
+        "applied_norm_p95": residual_stats["applied_norm_p95"],
+        "applied_norm_p99": residual_stats["applied_norm_p99"],
+        "saturation_ratio": residual_stats["saturation_ratio"],
+        "nan_inf_count": residual_stats["nan_inf_count"],
+        "dry_run": resolve_residual_dry_run(args),
+        "learned_residual_control_enabled": learned_residual_control_enabled(args),
+        "residual_scale": args.residual_scale,
+        "residual_actor_checkpoint": args.residual_actor_checkpoint,
         "selected_action_chunk_indices": [
             row["selected_indices"] for row in rows if row["execution_mode"] == "ee16_zero_residual"
         ],
@@ -539,6 +603,9 @@ def build_hybrid_row(**kwargs: Any) -> dict[str, Any]:
         "execution_mode": kwargs["execution_mode"],
         "ee16_execution_strategy": args.ee16_execution_strategy,
         "residual_actor": args.residual_actor,
+        "residual_dry_run": resolve_residual_dry_run(args),
+        "learned_residual_control_enabled": learned_residual_control_enabled(args),
+        "residual_scale": args.residual_scale,
         "residual_horizon_k": args.residual_horizon_k,
         "residual_target_horizon_offset": args.residual_target_horizon_offset,
         "residual_max_delta_local_xyz": args.residual_max_delta_local_xyz,
@@ -558,6 +625,12 @@ def build_hybrid_row(**kwargs: Any) -> dict[str, Any]:
         "num_intervention_steps": int(kwargs["intervention_meta"].get("num_steps_executed", 0)),
         "max_delta_norm": float(kwargs["intervention_meta"].get("max_delta_norm", 0.0)),
         "mean_delta_norm": float(kwargs["intervention_meta"].get("mean_delta_norm", 0.0)),
+        "pred_delta_norm_mean": float(kwargs["intervention_meta"].get("pred_delta_norm_mean", 0.0)),
+        "pred_delta_norm_max": float(kwargs["intervention_meta"].get("pred_delta_norm_max", 0.0)),
+        "applied_delta_norm_mean": float(kwargs["intervention_meta"].get("applied_delta_norm_mean", 0.0)),
+        "applied_delta_norm_max": float(kwargs["intervention_meta"].get("applied_delta_norm_max", 0.0)),
+        "saturation_count": int(kwargs["intervention_meta"].get("saturation_count", 0)),
+        "nan_inf_count": int(kwargs["intervention_meta"].get("nan_inf_count", 0)),
         "left_stabilization_count": kwargs["intervention_meta"].get("left_stabilization_count", 0),
         "simulator_crash": 0,
         **kwargs["pose"],
@@ -618,6 +691,50 @@ def first_intervention(rows: list[dict[str, Any]], field: str = "env_step") -> i
         if row["execution_mode"] == "ee16_zero_residual":
             return int(row[field])
     return None
+
+
+def residual_prediction_stats(records: list[dict[str, object]]) -> dict[str, float | int]:
+    pred_norm = np.asarray([row.get("pred_delta_norm", 0.0) for row in records], dtype=np.float64)
+    applied_norm = np.asarray([row.get("applied_delta_norm", 0.0) for row in records], dtype=np.float64)
+    saturation = np.asarray([row.get("saturation", 0) for row in records], dtype=np.float64)
+    nan_inf = np.asarray([row.get("has_nan_or_inf", 0) for row in records], dtype=np.int64)
+    if pred_norm.size == 0:
+        return {
+            "pred_norm_mean": 0.0,
+            "pred_norm_std": 0.0,
+            "pred_norm_max": 0.0,
+            "pred_norm_p50": 0.0,
+            "pred_norm_p90": 0.0,
+            "pred_norm_p95": 0.0,
+            "pred_norm_p99": 0.0,
+            "applied_norm_mean": 0.0,
+            "applied_norm_std": 0.0,
+            "applied_norm_max": 0.0,
+            "applied_norm_p50": 0.0,
+            "applied_norm_p90": 0.0,
+            "applied_norm_p95": 0.0,
+            "applied_norm_p99": 0.0,
+            "saturation_ratio": 0.0,
+            "nan_inf_count": 0,
+        }
+    return {
+        "pred_norm_mean": float(pred_norm.mean()),
+        "pred_norm_std": float(pred_norm.std()),
+        "pred_norm_max": float(pred_norm.max()),
+        "pred_norm_p50": float(np.percentile(pred_norm, 50)),
+        "pred_norm_p90": float(np.percentile(pred_norm, 90)),
+        "pred_norm_p95": float(np.percentile(pred_norm, 95)),
+        "pred_norm_p99": float(np.percentile(pred_norm, 99)),
+        "applied_norm_mean": float(applied_norm.mean()) if applied_norm.size else 0.0,
+        "applied_norm_std": float(applied_norm.std()) if applied_norm.size else 0.0,
+        "applied_norm_max": float(applied_norm.max()) if applied_norm.size else 0.0,
+        "applied_norm_p50": float(np.percentile(applied_norm, 50)) if applied_norm.size else 0.0,
+        "applied_norm_p90": float(np.percentile(applied_norm, 90)) if applied_norm.size else 0.0,
+        "applied_norm_p95": float(np.percentile(applied_norm, 95)) if applied_norm.size else 0.0,
+        "applied_norm_p99": float(np.percentile(applied_norm, 99)) if applied_norm.size else 0.0,
+        "saturation_ratio": float(saturation.mean()) if saturation.size else 0.0,
+        "nan_inf_count": int(nan_inf.sum()) if nan_inf.size else 0,
+    }
 
 
 def failure_reason(success: bool, done: bool, episode_length: int, max_steps: int) -> str | None:
@@ -706,7 +823,9 @@ def print_context(args: argparse.Namespace) -> None:
     print("---------------")
     for key, value in vars(args).items():
         print(f"{key}={value}")
-    for name in ("REPO_PATH", "ROBOTWIN_PATH", "ROBOT_PLATFORM", "CUDA_VISIBLE_DEVICES"):
+    print(f"resolved_residual_dry_run={resolve_residual_dry_run(args)}")
+    print(f"resolved_learned_residual_control_enabled={learned_residual_control_enabled(args)}")
+    for name in ("REPO_PATH", "ROBOTWIN_PATH", "ROBOTWIN_ASSETS_PATH", "ROBOT_PLATFORM", "CUDA_VISIBLE_DEVICES"):
         print(f"{name}={os.environ.get(name, '<unset>')}")
 
 
@@ -715,6 +834,30 @@ def print_summary(metrics: dict[str, Any]) -> None:
     print("--------------")
     for key in ("execution_mode", "ee16_execution_strategy", "success_rate", "mean_return", "save_dir"):
         print(f"{key}={metrics[key]}")
+
+
+def validate_residual_control_args(args: argparse.Namespace) -> None:
+    if bool(args.residual_dry_run) and bool(args.enable_learned_residual_control):
+        raise ValueError(
+            "--residual-dry-run and --enable-learned-residual-control cannot be enabled together."
+        )
+
+
+def resolve_residual_control_flags(args: argparse.Namespace) -> dict[str, bool]:
+    validate_residual_control_args(args)
+    if bool(args.residual_dry_run):
+        return {"dry_run": True, "learned_residual_control_enabled": False}
+    if bool(args.enable_learned_residual_control):
+        return {"dry_run": False, "learned_residual_control_enabled": True}
+    return {"dry_run": False, "learned_residual_control_enabled": False}
+
+
+def resolve_residual_dry_run(args: argparse.Namespace) -> bool:
+    return bool(resolve_residual_control_flags(args)["dry_run"])
+
+
+def learned_residual_control_enabled(args: argparse.Namespace) -> bool:
+    return bool(resolve_residual_control_flags(args)["learned_residual_control_enabled"])
 
 
 if __name__ == "__main__":

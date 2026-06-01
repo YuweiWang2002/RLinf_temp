@@ -37,7 +37,10 @@ def main() -> int:
         "execution_mode",
         "ee16_execution_strategy",
         "residual_actor",
+        "residual_scale",
+        "enable_learned_residual_control",
         "residual_horizon_k",
+        "max_steps",
         "gate_threshold",
         "num_episodes",
         "success_count",
@@ -50,6 +53,14 @@ def main() -> int:
         "first_intervention_steps",
         "num_interventions_total",
         "total_ee_intervention_steps",
+        "pred_norm_mean",
+        "pred_norm_max",
+        "pred_norm_p95",
+        "applied_norm_mean",
+        "applied_norm_max",
+        "applied_norm_p95",
+        "saturation_ratio_mean",
+        "nan_inf_count_total",
         "failure_reasons",
         "simulator_crash_count",
     ]
@@ -73,7 +84,10 @@ def summarize_condition(spec: str) -> dict[str, Any]:
             "execution_mode": "",
             "ee16_execution_strategy": "",
             "residual_actor": "",
+            "residual_scale": "",
+            "enable_learned_residual_control": "",
             "residual_horizon_k": "",
+            "max_steps": "",
             "gate_threshold": "",
             "num_episodes": 0,
             "success_count": 0,
@@ -86,6 +100,14 @@ def summarize_condition(spec: str) -> dict[str, Any]:
             "first_intervention_steps": "",
             "num_interventions_total": 0,
             "total_ee_intervention_steps": 0,
+            "pred_norm_mean": 0.0,
+            "pred_norm_max": 0.0,
+            "pred_norm_p95": 0.0,
+            "applied_norm_mean": 0.0,
+            "applied_norm_max": 0.0,
+            "applied_norm_p95": 0.0,
+            "saturation_ratio_mean": 0.0,
+            "nan_inf_count_total": 0,
             "failure_reasons": "missing_summary",
             "simulator_crash_count": 1,
         }
@@ -118,7 +140,10 @@ def summarize_condition(spec: str) -> dict[str, Any]:
         "execution_mode": summary.get("execution_mode", ""),
         "ee16_execution_strategy": summary.get("ee16_execution_strategy", ""),
         "residual_actor": summary.get("residual_actor", ""),
+        "residual_scale": summary.get("residual_scale", ""),
+        "enable_learned_residual_control": summary.get("enable_learned_residual_control", ""),
         "residual_horizon_k": summary.get("residual_horizon_k", ""),
+        "max_steps": summary.get("max_steps", ""),
         "gate_threshold": summary.get("gate_threshold", ""),
         "num_episodes": len(episodes),
         "success_count": int(sum(successes)),
@@ -131,6 +156,14 @@ def summarize_condition(spec: str) -> dict[str, Any]:
         "first_intervention_steps": join_values(first_intervention_steps),
         "num_interventions_total": int(sum(int(value) for value in num_interventions)),
         "total_ee_intervention_steps": int(sum(int(value) for value in total_ee_steps)),
+        "pred_norm_mean": mean_field(episodes, "pred_norm_mean"),
+        "pred_norm_max": max_field(episodes, "pred_norm_max"),
+        "pred_norm_p95": mean_field(episodes, "pred_norm_p95"),
+        "applied_norm_mean": mean_field(episodes, "applied_norm_mean"),
+        "applied_norm_max": max_field(episodes, "applied_norm_max"),
+        "applied_norm_p95": mean_field(episodes, "applied_norm_p95"),
+        "saturation_ratio_mean": mean_field(episodes, "saturation_ratio"),
+        "nan_inf_count_total": int(sum(int(ep.get("nan_inf_count", 0)) for ep in episodes)),
         "failure_reasons": join_values(ep.get("failure_reason") for ep in episodes if ep.get("failure_reason")),
         "simulator_crash_count": int(sum(int(bool(ep.get("simulator_crash", False))) for ep in episodes)),
     }
@@ -154,6 +187,11 @@ def resolve_summary_path(path: Path) -> Path:
 def mean_field(episodes: list[dict[str, Any]], field: str) -> float:
     values = [float(ep[field]) for ep in episodes if ep.get(field) is not None]
     return float(np.mean(values)) if values else 0.0
+
+
+def max_field(episodes: list[dict[str, Any]], field: str) -> float:
+    values = [float(ep[field]) for ep in episodes if ep.get(field) is not None]
+    return float(np.max(values)) if values else 0.0
 
 
 def infer_episode_from_log(episode: dict[str, Any]) -> dict[str, Any]:

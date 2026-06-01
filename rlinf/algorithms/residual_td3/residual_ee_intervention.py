@@ -16,11 +16,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Protocol
 
 import torch
 
 from .residual_actor import ResidualActorConfig, ZeroInitResidualActorMLP
+from .residual_bc_training import (
+    build_residual_actor_obs_features,
+    build_residual_actor_obs_features_from_endpose,
+    residual_actor_obs_features_to_tensor,
+)
 
 QPOS14_LEFT_JOINTS = slice(0, 6)
 QPOS14_LEFT_GRIPPER = 6
@@ -54,6 +60,9 @@ class ResidualEEInterventionConfig:
     left_stabilization_mode: str = "none"
     left_deadband_xyz: float = 1e-4
     left_lowpass_alpha: float = 0.5
+    residual_scale: float = 1.0
+    dry_run: bool = False
+    learned_residual_control_enabled: bool = False
 
 
 @dataclass(frozen=True)
@@ -69,6 +78,8 @@ class ResidualEEObservation:
     right_gripper: torch.Tensor
     gate_score: float | None
     intervention_step_i: int
+    gate_label: float | None = None
+    gate_positive_fraction: float | None = None
 
 
 class ResidualEEActor(Protocol):
@@ -95,6 +106,36 @@ class ConstantResidualActor:
     def predict_delta_local_xyz(self, obs: ResidualEEObservation) -> torch.Tensor:
         del obs
         return torch.tensor(self.delta_local_xyz, dtype=torch.float32)
+
+
+class RandomNoiseResidualActor:
+    """Actor that samples clipped Gaussian local xyz residuals."""
+
+    def __init__(
+        self,
+        noise_std: float = 0.001,
+        max_delta_local_xyz: float | tuple[float, float, float] = 0.05,
+        seed: int | None = None,
+    ) -> None:
+        if noise_std < 0.0:
+            raise ValueError("noise_std must be non-negative.")
+        self.noise_std = float(noise_std)
+        self.max_delta_local_xyz = max_delta_local_xyz
+        self.generator = torch.Generator()
+        if seed is not None:
+            self.generator.manual_seed(int(seed))
+
+    def predict_delta_local_xyz(self, obs: ResidualEEObservation) -> torch.Tensor:
+        del obs
+        delta = torch.randn(3, generator=self.generator, dtype=torch.float32) * self.noise_std
+        return torch.clamp(delta, min=-self._max_delta_tensor(), max=self._max_delta_tensor())
+
+    def _max_delta_tensor(self) -> torch.Tensor:
+        if isinstance(self.max_delta_local_xyz, tuple):
+            if len(self.max_delta_local_xyz) != 3:
+                raise ValueError("max_delta_local_xyz tuple must have length 3.")
+            return torch.tensor(self.max_delta_local_xyz, dtype=torch.float32)
+        return torch.full((3,), float(self.max_delta_local_xyz), dtype=torch.float32)
 
 
 class ZeroInitResidualActor:
@@ -124,6 +165,51 @@ class ZeroInitResidualActor:
         vector = residual_ee_observation_to_tensor(obs).reshape(1, -1).to(self.device)
         with torch.no_grad():
             return self.model(vector)[0, 0]
+
+
+class BCResidualActor:
+    """Saved BC residual actor that predicts a full local-xyz delta chunk."""
+
+    def __init__(
+        self,
+        model: ZeroInitResidualActorMLP,
+        *,
+        device: str | torch.device = "cpu",
+        checkpoint_path: str | None = None,
+    ) -> None:
+        self.device = torch.device(device)
+        self.model = model.to(self.device)
+        self.model.eval()
+        self.checkpoint_path = checkpoint_path
+
+    @classmethod
+    def load_from_checkpoint(
+        cls,
+        checkpoint_path: str | Path,
+        *,
+        device: str | torch.device = "cpu",
+    ) -> "BCResidualActor":
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model = ZeroInitResidualActorMLP(ResidualActorConfig(**checkpoint["actor_config"]))
+        model.load_state_dict(checkpoint["model_state_dict"])
+        return cls(model, device=device, checkpoint_path=str(checkpoint_path))
+
+    @property
+    def chunk_len(self) -> int:
+        return int(self.model.cfg.chunk_len)
+
+    def predict_delta_chunk_local_xyz(self, obs_vector: torch.Tensor) -> torch.Tensor:
+        """Return ``[K, 3]`` predicted local residuals for one intervention."""
+
+        if obs_vector.ndim != 1 or obs_vector.shape[0] != self.model.cfg.obs_dim:
+            raise ValueError(
+                f"obs_vector must have shape [{self.model.cfg.obs_dim}], got {tuple(obs_vector.shape)}."
+            )
+        with torch.no_grad():
+            return self.model(obs_vector.reshape(1, -1).to(self.device))[0].detach()
+
+    def predict_delta_local_xyz(self, obs: ResidualEEObservation) -> torch.Tensor:
+        return self.predict_delta_chunk_local_xyz(residual_ee_observation_to_tensor(obs))[0]
 
 
 @dataclass(frozen=True)
@@ -172,30 +258,72 @@ class ResidualEEInterventionRunner:
             raise ValueError(f"bridge must return shape [B, K, 16], got {tuple(base_ee16.shape)}.")
 
         exec_ee16 = base_ee16.clone()
+        gate_label = float(gate_score is not None and gate_threshold is not None and gate_score >= gate_threshold)
+        gate_positive_fraction = resolve_gate_positive_fraction_online(gate_score, gate_label)
+        obs_features = build_residual_actor_obs_features_from_endpose(
+            base_ee16[0, 0],
+            gate_label=gate_label,
+            gate_positive_fraction=gate_positive_fraction,
+        )
+        obs_vector = residual_actor_obs_features_to_tensor(obs_features)
+        pred_delta_chunk = self._predict_delta_chunk_if_supported(obs_vector, base_ee16.shape[1])
+        if pred_delta_chunk is not None:
+            pred_delta_chunk = pred_delta_chunk.to(device=qpos14_chunk.device, dtype=qpos14_chunk.dtype)
         records: list[dict[str, object]] = []
-        delta_norms = []
+        applied_delta_norms = []
+        pred_delta_norms = []
+        saturation_count = 0
+        nan_inf_count = 0
         stabilization_count = 0
         previous_left_pose: torch.Tensor | None = None
         max_delta = self._max_delta_tensor(qpos14_chunk.device, qpos14_chunk.dtype)
 
         for local_i, chunk_index in enumerate(selected_indices):
             base_step = base_ee16[0, local_i]
-            residual_obs = self._build_observation(base_step, gate_score, local_i)
-            delta_local = self.actor.predict_delta_local_xyz(residual_obs).to(
-                device=qpos14_chunk.device,
-                dtype=qpos14_chunk.dtype,
-            )
-            if delta_local.shape != (3,):
-                raise ValueError(f"delta_local_xyz must have shape [3], got {tuple(delta_local.shape)}.")
-            delta_local = torch.clamp(delta_local, min=-max_delta, max=max_delta)
-            delta_world = quat_wxyz_to_matrix(base_step[ENDPOSE16_LEFT_QUAT_WXYZ]) @ delta_local
-            exec_ee16[0, local_i, ENDPOSE16_RIGHT_XYZ] += delta_world
+            if pred_delta_chunk is None:
+                residual_obs = self._build_observation(
+                    base_step,
+                    gate_score,
+                    local_i,
+                    gate_label=gate_label,
+                    gate_positive_fraction=gate_positive_fraction,
+                )
+                pred_delta_local = self.actor.predict_delta_local_xyz(residual_obs).to(
+                    device=qpos14_chunk.device,
+                    dtype=qpos14_chunk.dtype,
+                )
+            else:
+                pred_delta_local = pred_delta_chunk[local_i]
+            if pred_delta_local.shape != (3,):
+                raise ValueError(
+                    f"pred_delta_local_xyz must have shape [3], got {tuple(pred_delta_local.shape)}."
+                )
+            has_nan_or_inf = not bool(torch.isfinite(pred_delta_local).all().detach().cpu())
+            clipped_delta_local = torch.clamp(pred_delta_local, min=-max_delta, max=max_delta)
+            saturated = bool(torch.ne(pred_delta_local, clipped_delta_local).any().detach().cpu())
+            exec_before_residual = exec_ee16[0, local_i].clone()
+            if self.config.dry_run:
+                applied_delta_local = torch.zeros_like(clipped_delta_local)
+            elif self.config.learned_residual_control_enabled:
+                applied_delta_local = clipped_delta_local * float(self.config.residual_scale)
+            else:
+                applied_delta_local = torch.zeros_like(clipped_delta_local)
+            pred_delta_world = quat_wxyz_to_matrix(base_step[ENDPOSE16_LEFT_QUAT_WXYZ]) @ pred_delta_local
+            applied_delta_world = quat_wxyz_to_matrix(base_step[ENDPOSE16_LEFT_QUAT_WXYZ]) @ applied_delta_local
+            if self.config.learned_residual_control_enabled and not self.config.dry_run:
+                exec_ee16[0, local_i, ENDPOSE16_RIGHT_XYZ] += applied_delta_world
             stabilized, previous_left_pose = self._stabilize_left_pose(
                 exec_ee16[0, local_i],
                 previous_left_pose,
             )
             stabilization_count += int(stabilized)
-            delta_norms.append(float(torch.linalg.norm(delta_local).detach().cpu()))
+            pred_delta_norm = float(torch.linalg.norm(pred_delta_local).detach().cpu())
+            applied_delta_norm = float(torch.linalg.norm(applied_delta_local).detach().cpu())
+            pred_delta_norms.append(pred_delta_norm)
+            applied_delta_norms.append(applied_delta_norm)
+            saturation_count += int(saturated)
+            nan_inf_count += int(has_nan_or_inf)
+            obs_features_log = {key: value.detach().cpu().tolist() for key, value in obs_features.items()}
             records.append(
                 {
                     "episode_id": episode_id,
@@ -205,11 +333,29 @@ class ResidualEEInterventionRunner:
                     "gate_score": gate_score,
                     "gate_threshold": gate_threshold,
                     "action_chunk_index": int(chunk_index),
+                    "gate_label_online": gate_label,
+                    "gate_positive_fraction_online": gate_positive_fraction,
+                    "gate_positive_fraction_source": "gate_score" if gate_score is not None else "gate_label",
                     "base_qpos14": selected_qpos[0, local_i].detach().cpu().tolist(),
                     "base_ee16": base_step.detach().cpu().tolist(),
+                    "obs_features": obs_features_log,
+                    "obs_vector": obs_vector.detach().cpu().tolist(),
+                    "obs_feature_reference_step": 0,
+                    "pred_delta_local_xyz": pred_delta_local.detach().cpu().tolist(),
+                    "pred_delta_world_xyz": pred_delta_world.detach().cpu().tolist(),
+                    "pred_delta_norm": pred_delta_norm,
+                    "residual_scale": float(self.config.residual_scale),
+                    "noise_std": float(getattr(self.actor, "noise_std", 0.0)),
+                    "dry_run": bool(self.config.dry_run),
+                    "learned_residual_control_enabled": bool(self.config.learned_residual_control_enabled),
+                    "applied_delta_local_xyz": applied_delta_local.detach().cpu().tolist(),
+                    "applied_delta_world_xyz": applied_delta_world.detach().cpu().tolist(),
+                    "applied_delta_norm": applied_delta_norm,
+                    "exec_ee16_before_residual": exec_before_residual.detach().cpu().tolist(),
+                    "exec_ee16_after_residual": exec_ee16[0, local_i].detach().cpu().tolist(),
                     "exec_ee16": exec_ee16[0, local_i].detach().cpu().tolist(),
-                    "delta_local_xyz": delta_local.detach().cpu().tolist(),
-                    "delta_world_xyz": delta_world.detach().cpu().tolist(),
+                    "delta_local_xyz": applied_delta_local.detach().cpu().tolist(),
+                    "delta_world_xyz": applied_delta_world.detach().cpu().tolist(),
                     "left_xyz": base_step[ENDPOSE16_LEFT_XYZ].detach().cpu().tolist(),
                     "left_quat": base_step[ENDPOSE16_LEFT_QUAT_WXYZ].detach().cpu().tolist(),
                     "right_xyz_base": base_step[ENDPOSE16_RIGHT_XYZ].detach().cpu().tolist(),
@@ -223,15 +369,36 @@ class ResidualEEInterventionRunner:
                     ),
                     "left_gripper": float(base_step[ENDPOSE16_LEFT_GRIPPER].detach().cpu()),
                     "right_gripper": float(base_step[ENDPOSE16_RIGHT_GRIPPER].detach().cpu()),
+                    "saturation": int(saturated),
+                    "has_nan_or_inf": int(has_nan_or_inf),
                 }
             )
 
         metadata = {
             "num_steps_executed": int(len(selected_indices)),
             "selected_indices": [int(index) for index in selected_indices],
-            "max_delta_norm": float(max(delta_norms, default=0.0)),
-            "mean_delta_norm": float(sum(delta_norms) / len(delta_norms)) if delta_norms else 0.0,
+            "max_delta_norm": float(max(applied_delta_norms, default=0.0)),
+            "mean_delta_norm": float(sum(applied_delta_norms) / len(applied_delta_norms))
+            if applied_delta_norms
+            else 0.0,
+            "pred_delta_norm_max": float(max(pred_delta_norms, default=0.0)),
+            "pred_delta_norm_mean": float(sum(pred_delta_norms) / len(pred_delta_norms))
+            if pred_delta_norms
+            else 0.0,
+            "applied_delta_norm_max": float(max(applied_delta_norms, default=0.0)),
+            "applied_delta_norm_mean": float(sum(applied_delta_norms) / len(applied_delta_norms))
+            if applied_delta_norms
+            else 0.0,
+            "saturation_count": int(saturation_count),
+            "nan_inf_count": int(nan_inf_count),
+            "dry_run": bool(self.config.dry_run),
+            "learned_residual_control_enabled": bool(self.config.learned_residual_control_enabled),
+            "residual_scale": float(self.config.residual_scale),
             "left_stabilization_count": int(stabilization_count),
+            "gate_label_online": gate_label,
+            "gate_positive_fraction_online": gate_positive_fraction,
+            "gate_positive_fraction_source": "gate_score" if gate_score is not None else "gate_label",
+            "obs_feature_reference_step": 0,
             "records": records,
         }
         return ResidualEEInterventionResult(
@@ -251,11 +418,28 @@ class ResidualEEInterventionRunner:
             )
         return list(range(start, end))
 
+    def _predict_delta_chunk_if_supported(
+        self,
+        obs_vector: torch.Tensor,
+        chunk_len: int,
+    ) -> torch.Tensor | None:
+        if not hasattr(self.actor, "predict_delta_chunk_local_xyz"):
+            return None
+        pred = self.actor.predict_delta_chunk_local_xyz(obs_vector)
+        if pred.ndim != 2 or pred.shape[-1] != 3:
+            raise ValueError(f"predicted residual chunk must have shape [K, 3], got {tuple(pred.shape)}.")
+        if pred.shape[0] < chunk_len:
+            raise ValueError(f"predicted residual chunk length {pred.shape[0]} is smaller than {chunk_len}.")
+        return pred[:chunk_len].to(dtype=torch.float32)
+
     def _build_observation(
         self,
         base_step: torch.Tensor,
         gate_score: float | None,
         intervention_step_i: int,
+        *,
+        gate_label: float | None = None,
+        gate_positive_fraction: float | None = None,
     ) -> ResidualEEObservation:
         left_xyz = base_step[ENDPOSE16_LEFT_XYZ]
         left_quat = base_step[ENDPOSE16_LEFT_QUAT_WXYZ]
@@ -272,6 +456,8 @@ class ResidualEEInterventionRunner:
             right_gripper=base_step[ENDPOSE16_RIGHT_GRIPPER],
             gate_score=gate_score,
             intervention_step_i=intervention_step_i,
+            gate_label=gate_label,
+            gate_positive_fraction=gate_positive_fraction,
         )
 
     def _stabilize_left_pose(
@@ -320,6 +506,10 @@ class ResidualEEInterventionRunner:
             raise ValueError("left_stabilization_mode must be none/deadband/lowpass/freeze.")
         if not 0.0 <= cfg.left_lowpass_alpha <= 1.0:
             raise ValueError("left_lowpass_alpha must be in [0, 1].")
+        if cfg.residual_scale < 0.0:
+            raise ValueError("residual_scale must be non-negative.")
+        if cfg.dry_run and cfg.learned_residual_control_enabled:
+            raise ValueError("dry_run and learned_residual_control_enabled cannot both be true.")
 
     @staticmethod
     def _validate_qpos14_chunk(qpos14_chunk: torch.Tensor) -> None:
@@ -346,26 +536,33 @@ def quat_wxyz_to_matrix(quat: torch.Tensor) -> torch.Tensor:
 
 def residual_ee_observation_to_tensor(obs: ResidualEEObservation) -> torch.Tensor:
     """Pack a residual EE observation into the default actor feature vector."""
-    gate = torch.tensor(
-        [0.0 if obs.gate_score is None else float(obs.gate_score)],
-        dtype=torch.float32,
-        device=obs.left_xyz.device,
+    features = build_residual_actor_obs_features(
+        base_left_xyz=obs.left_xyz,
+        base_left_quat_wxyz=obs.left_quat_wxyz,
+        base_right_xyz=obs.right_xyz,
+        base_right_quat_wxyz=obs.right_quat_wxyz,
+        left_gripper=obs.left_gripper,
+        right_gripper=obs.right_gripper,
+        gate_label=float(obs.gate_label) if obs.gate_label is not None else 0.0,
+        gate_positive_fraction=(
+            float(obs.gate_positive_fraction)
+            if obs.gate_positive_fraction is not None
+            else resolve_gate_positive_fraction_online(obs.gate_score, obs.gate_label)
+        ),
     )
-    step = torch.tensor(
-        [float(obs.intervention_step_i)],
-        dtype=torch.float32,
-        device=obs.left_xyz.device,
-    )
-    return torch.cat(
-        (
-            obs.left_xyz.reshape(-1).to(dtype=torch.float32),
-            obs.left_quat_wxyz.reshape(-1).to(dtype=torch.float32),
-            obs.right_xyz.reshape(-1).to(dtype=torch.float32),
-            obs.right_quat_wxyz.reshape(-1).to(dtype=torch.float32),
-            obs.relative_xyz_left_frame.reshape(-1).to(dtype=torch.float32),
-            obs.left_gripper.reshape(-1).to(dtype=torch.float32),
-            obs.right_gripper.reshape(-1).to(dtype=torch.float32),
-            gate,
-            step,
-        )
-    )
+    expected_relative = torch.as_tensor(obs.relative_xyz_left_frame, dtype=torch.float32).reshape(-1)
+    actual_relative = features["relative_right_xyz_in_left_frame"]
+    if not torch.allclose(actual_relative, expected_relative.to(device=actual_relative.device), atol=1e-6):
+        raise ValueError("ResidualEEObservation relative_xyz_left_frame is inconsistent with pose/quaternion inputs.")
+    return residual_actor_obs_features_to_tensor(features)
+
+
+def resolve_gate_positive_fraction_online(
+    gate_score: float | None,
+    gate_label: float | None,
+) -> float:
+    """Resolve online gate_positive_fraction when no future gate sequence exists."""
+
+    if gate_score is not None:
+        return float(gate_score)
+    return 0.0 if gate_label is None else float(gate_label)
