@@ -212,6 +212,10 @@ class BCResidualActor:
         return self.predict_delta_chunk_local_xyz(residual_ee_observation_to_tensor(obs))[0]
 
 
+class TD3ResidualActor(BCResidualActor):
+    """Offline TD3 residual actor with the same inference contract as BC."""
+
+
 @dataclass(frozen=True)
 class ResidualEEInterventionResult:
     """Output and metadata for one intervention."""
@@ -245,6 +249,9 @@ class ResidualEEInterventionRunner:
         episode_id: int | None = None,
         env_step: int | None = None,
         intervention_id: int | None = None,
+        intervention_stage: str = "handover",
+        trigger_source: str = "handover_gate",
+        trigger_metadata: dict[str, object] | None = None,
     ) -> ResidualEEInterventionResult:
         """Build an executable EE16 intervention chunk and per-step records."""
         self._validate_qpos14_chunk(qpos14_chunk)
@@ -277,6 +284,7 @@ class ResidualEEInterventionRunner:
         stabilization_count = 0
         previous_left_pose: torch.Tensor | None = None
         max_delta = self._max_delta_tensor(qpos14_chunk.device, qpos14_chunk.dtype)
+        trigger_metadata = dict(trigger_metadata or {})
 
         for local_i, chunk_index in enumerate(selected_indices):
             base_step = base_ee16[0, local_i]
@@ -329,6 +337,8 @@ class ResidualEEInterventionRunner:
                     "episode_id": episode_id,
                     "env_step": env_step,
                     "intervention_id": intervention_id,
+                    "intervention_stage": intervention_stage,
+                    "trigger_source": trigger_source,
                     "intervention_step_i": local_i,
                     "gate_score": gate_score,
                     "gate_threshold": gate_threshold,
@@ -399,6 +409,9 @@ class ResidualEEInterventionRunner:
             "gate_positive_fraction_online": gate_positive_fraction,
             "gate_positive_fraction_source": "gate_score" if gate_score is not None else "gate_label",
             "obs_feature_reference_step": 0,
+            "intervention_stage": intervention_stage,
+            "trigger_source": trigger_source,
+            **trigger_metadata,
             "records": records,
         }
         return ResidualEEInterventionResult(

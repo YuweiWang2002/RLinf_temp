@@ -30,6 +30,12 @@ from .endpose_bridge import (
     xyzw_to_wxyz,
 )
 from .fk_bridge import AlohaFKBridge, AlohaFKBridgeConfig
+from .pregrasp_trigger import (
+    PregraspTriggerConfig,
+    PregraspTriggerResult,
+    choose_intervention_stage,
+    detect_pregrasp_trigger,
+)
 from .residual_actor import ResidualActorConfig, ZeroInitResidualActorMLP
 from .residual_bc_dataset import ResidualBCTargetBuilder, ResidualBCTargetConfig
 from .residual_bc_training import (
@@ -88,6 +94,8 @@ __all__ = [
     "BCResidualActor",
     "ConstantResidualActor",
     "RandomNoiseResidualActor",
+    "PregraspTriggerConfig",
+    "PregraspTriggerResult",
     "ReplayRewardConfig",
     "ResidualEEInterventionConfig",
     "ResidualEEInterventionRunner",
@@ -100,6 +108,8 @@ __all__ = [
     "ZeroResidualActor",
     "build_residual_action_spec",
     "build_replay_from_rollout",
+    "choose_intervention_stage",
+    "detect_pregrasp_trigger",
     "episode_reward",
     "load_baseline_success_by_seed",
     "normalize_gripper_column",

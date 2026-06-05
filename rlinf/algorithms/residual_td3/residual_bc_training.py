@@ -74,7 +74,7 @@ class ResidualBCNpzDataset(Dataset):
         self.cfg = cfg or ResidualBCDatasetConfig()
         if not self.path.exists():
             raise FileNotFoundError(f"Residual BC target npz not found: {self.path}")
-        with np.load(self.path) as data:
+        with np.load(self.path, allow_pickle=True) as data:
             self.arrays = {key: data[key] for key in data.files}
         self._validate_arrays()
         if indices is None:

@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--residual-actor-checkpoint", default=None)
     parser.add_argument("--residual-scale", type=float, default=1.0)
     parser.add_argument("--residual-noise-std", type=float, default=0.001)
-    parser.add_argument("--residual-horizon-k", type=int, default=10)
+    parser.add_argument("--residual-horizon-k", type=int, default=50)
     parser.add_argument("--residual-max-delta-local-xyz", type=float, default=0.05)
     parser.add_argument("--residual-target-horizon-offset", type=int, default=0)
     parser.add_argument("--gate-threshold", type=float, default=0.6)
@@ -58,6 +58,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=600)
     parser.add_argument("--seed", type=int, default=100100000)
     parser.add_argument("--seed-offset", type=int, default=0)
+    parser.add_argument(
+        "--seed-list",
+        default=None,
+        help="Comma/whitespace separated seeds, or a text file containing one seed per line.",
+    )
+    parser.add_argument(
+        "--hard-seeds-json",
+        default=None,
+        help="Optional hard seed JSON from logs/hard_eval_v1/hard_seeds.json or hard_seed_summary.json.",
+    )
+    parser.add_argument(
+        "--hard-seed-groups",
+        default="all_fail,candidate_hard_eval_seeds,rows,selected",
+        help="Priority-ordered groups to read from --hard-seeds-json.",
+    )
+    parser.add_argument("--num-hard-seeds", type=int, default=None)
+    parser.add_argument("--episodes-per-seed", type=int, default=1)
     parser.add_argument("--use-eval-success-seeds", action="store_true")
     parser.add_argument("--env-split", choices=("train", "eval"), default="eval")
     parser.add_argument("--task-name", default=None)
@@ -113,7 +130,8 @@ def main() -> int:
         model = load_model(build_actor_model_cfg(model_args), rollout_args.device)
         task = get_single_task_after_reset(env)
         intervention_runner = build_intervention_runner(task, rollout_args)
-        episode_seeds = select_episode_seeds(env_cfg, env_args)
+        episode_seeds = resolve_episode_seeds(args, env_cfg, env_args)
+        rollout_args.num_episodes = len(episode_seeds)
         rollout_summary = run_episodes(
             env,
             model,
@@ -146,6 +164,7 @@ def main() -> int:
         )
         config = {
             **vars(args),
+            "episode_seeds": episode_seeds,
             "rollout_save_dir": str(rollout_dir),
             "rollout_summary_path": str(rollout_summary_path),
         }
@@ -215,6 +234,96 @@ def build_rollout_args(args: argparse.Namespace) -> SimpleNamespace:
         robotwin_setup_max_retries=args.robotwin_setup_max_retries,
         debug_ee16_timing=False,
     )
+
+
+def resolve_episode_seeds(args: argparse.Namespace, env_cfg: object, env_args: SimpleNamespace) -> list[int]:
+    """Resolve explicit/hard seed inputs or fall back to the normal eval seed selector."""
+
+    seeds: list[int] = []
+    if args.seed_list:
+        seeds.extend(parse_seed_list(args.seed_list))
+    if args.hard_seeds_json:
+        groups = [group.strip() for group in args.hard_seed_groups.split(",") if group.strip()]
+        seeds.extend(load_hard_seed_candidates(args.hard_seeds_json, groups))
+    if not seeds:
+        return select_episode_seeds(env_cfg, env_args)
+
+    seeds = unique_ordered(seeds)
+    if args.num_hard_seeds is not None:
+        if args.num_hard_seeds < 1:
+            raise ValueError("--num-hard-seeds must be positive.")
+        seeds = seeds[: args.num_hard_seeds]
+    if args.episodes_per_seed < 1:
+        raise ValueError("--episodes-per-seed must be positive.")
+    return [seed for seed in seeds for _ in range(args.episodes_per_seed)]
+
+
+def parse_seed_list(value: str) -> list[int]:
+    """Parse a seed list from inline text or a text file."""
+
+    path = Path(value)
+    text = path.read_text(encoding="utf-8") if path.exists() else value
+    return [int(token) for token in text.replace(",", " ").split()]
+
+
+def load_hard_seed_candidates(path: str | Path, groups: list[str]) -> list[int]:
+    """Load hard seeds from hard mining summaries or hard_eval_v1 selections."""
+
+    with Path(path).open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    seeds: list[int] = []
+    for group in groups:
+        seeds.extend(extract_seed_group(data, group))
+    return unique_ordered(seeds)
+
+
+def extract_seed_group(data: object, group: str) -> list[int]:
+    """Extract one seed group from supported hard seed JSON layouts."""
+
+    if not isinstance(data, dict):
+        return []
+    value = data.get(group)
+    if isinstance(value, list):
+        return seeds_from_json_list(value)
+    if isinstance(value, dict):
+        return seeds_from_json_list(list(value.values()))
+
+    rows = data.get("rows")
+    if isinstance(rows, list):
+        if group == "rows":
+            return seeds_from_json_list(rows)
+        return seeds_from_json_list(
+            row for row in rows if isinstance(row, dict) and row.get("source_group") == group
+        )
+    return []
+
+
+def seeds_from_json_list(values: object) -> list[int]:
+    """Return integer seeds from JSON scalar/list/dict rows."""
+
+    seeds: list[int] = []
+    if not isinstance(values, list):
+        values = list(values)
+    for value in values:
+        if isinstance(value, dict):
+            if "seed" in value:
+                seeds.append(int(value["seed"]))
+        else:
+            seeds.append(int(value))
+    return seeds
+
+
+def unique_ordered(values: list[int]) -> list[int]:
+    """Keep first occurrence of each seed."""
+
+    seen: set[int] = set()
+    unique: list[int] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        unique.append(value)
+    return unique
 
 
 if __name__ == "__main__":

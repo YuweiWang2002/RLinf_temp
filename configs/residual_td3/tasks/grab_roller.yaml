@@ -1,0 +1,76 @@
+task:
+  name: grab_roller
+  robotwin_task_name: grab_roller
+  env_type: robotwin
+
+robotwin:
+  env_config: TODO
+
+pi05:
+  config: TODO
+  checkpoint: TODO
+  norm_stats_path: TODO
+  chunk_len: 50
+
+action_space:
+  base: qpos14
+  intervention: endpose16
+  qpos_dim: 14
+  endpose_dim: 16
+  gripper_indices:
+    left: 6
+    right: 13
+  ee_indices:
+    left_xyz: [0, 1, 2]
+    right_xyz: [8, 9, 10]
+
+stages:
+  pregrasp:
+    enabled: true
+    trigger:
+      type: TODO
+  grasp:
+    enabled: true
+    trigger:
+      type: TODO
+  placement:
+    enabled: false
+    trigger:
+      type: TODO
+
+gates:
+  chunk_aware:
+    checkpoint: TODO
+    threshold: 0.6
+    chunk_len: 50
+
+intervention:
+  stage: grasp
+  horizon_k: 50
+  execution_mode: ee
+  execution_strategy: pointwise
+  delta_max: 0.05
+  residual:
+    enabled: false
+    actor_type: zero
+    actor_checkpoint: TODO
+    scale: 1.0
+
+replay:
+  action_source: zero
+  reward_mode: sparse_success
+  max_steps: 600
+  seed_list: TODO
+  hard_seed_set: TODO
+
+eval:
+  normal:
+    num_episodes: 20
+  hard:
+    seed_json: TODO
+  videos:
+    enabled: false
+
+rollout:
+  execution_mode: gate_controlled_hybrid
+  save_dir: TODO

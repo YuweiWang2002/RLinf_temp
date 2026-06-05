@@ -820,7 +820,12 @@ def canonicalize_robotwin_assets_root(path_str: str) -> str:
 def _extend_envs_namespace_if_needed(robotwin_path: str) -> None:
     """Allow `envs` to resolve across RoboTwin's split env directories."""
 
-    import envs
+    cwd = os.getcwd()
+    try:
+        os.chdir(robotwin_path)
+        import envs
+    finally:
+        os.chdir(cwd)
 
     robotwin_envs = Path(robotwin_path) / "robotwin" / "envs"
     envs.__path__ = extend_path(list(envs.__path__), envs.__name__)

@@ -5,10 +5,6 @@ import numpy as np
 import pytest
 import torch
 
-from scripts.rollout_pi05_gate_controlled_hybrid_zero_residual import (
-    resolve_residual_control_flags,
-)
-from scripts.train_residual_actor_bc import baseline_comparison, train_residual_actor_bc
 from rlinf.algorithms.residual_td3.residual_actor import (
     ResidualActorConfig,
     ZeroInitResidualActorMLP,
@@ -20,6 +16,10 @@ from rlinf.algorithms.residual_td3.residual_bc_training import (
     residual_actor_obs_features_to_tensor,
     split_by_episode,
 )
+from scripts.rollout_pi05_gate_controlled_hybrid_zero_residual import (
+    resolve_residual_control_flags,
+)
+from scripts.train_residual_actor_bc import baseline_comparison, train_residual_actor_bc
 
 
 def _write_npz(path: Path, *, num_samples: int = 8, horizon: int = 3, zero_target: bool = False):
@@ -72,6 +72,18 @@ def test_dataset_reads_target_npz(tmp_path):
     assert item["obs_vector"].shape == (21,)
     assert item["target_delta_local_xyz"].shape == (3, 3)
     assert item["episode_index"] == 0
+
+
+def test_dataset_reads_npz_with_object_metadata(tmp_path):
+    path = tmp_path / "targets_with_metadata.npz"
+    arrays = _write_npz(path)
+    arrays["source_demo_path"] = np.asarray(["demo_0.hdf5"] * arrays["target_delta_local_xyz"].shape[0], dtype=object)
+    np.savez_compressed(path, **arrays)
+
+    dataset = ResidualBCNpzDataset(path, ResidualBCDatasetConfig(target_horizon_k=3))
+
+    assert len(dataset) == arrays["target_delta_local_xyz"].shape[0]
+    assert dataset.obs_dim == 21
 
 
 def test_zero_predictor_baseline_metrics_are_computed_on_same_targets():

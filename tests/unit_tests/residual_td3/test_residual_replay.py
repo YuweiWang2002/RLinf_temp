@@ -14,6 +14,12 @@ from rlinf.algorithms.residual_td3.residual_replay import (
     load_baseline_success_by_seed,
     save_replay_artifacts,
 )
+from scripts.collect_residual_replay import load_hard_seed_candidates, parse_seed_list
+from scripts.convert_rollout_logs_to_residual_replay import (
+    missing_required_fields,
+    resolve_action_source,
+)
+from scripts.mine_hard_seeds import condition_action_source
 
 
 def _record(step: int, action=(0.0, 0.0, 0.0), *, intervention_id: int = 0):
@@ -139,3 +145,61 @@ def test_collect_residual_replay_contains_no_optimizer_update():
     assert "optimizer" not in source
     assert ".backward(" not in source
     assert "critic" not in source
+
+
+def test_converter_reports_missing_required_fields():
+    missing = missing_required_fields([{"obs_vector": [0.0] * 21}])
+
+    assert "applied_delta_local_xyz" in missing
+    assert "base_ee16" in missing
+
+
+def test_converter_action_source_auto_names():
+    assert resolve_action_source("auto", Path("pointwise_zero_k10_eval20")) == "zero"
+    assert resolve_action_source("auto", Path("bc_s05_eval20")) == "bc"
+    assert resolve_action_source("auto", Path("qpos14_baseline_eval20")) == "qpos14"
+
+
+def test_hard_seed_condition_action_source_mapping():
+    assert condition_action_source("zero_k10") == "zero"
+    assert condition_action_source("bc_s05") == "bc"
+    assert condition_action_source("qpos14") == "qpos14"
+
+
+def test_collect_residual_replay_parses_hard_eval_rows(tmp_path):
+    path = tmp_path / "hard_seeds.json"
+    path.write_text(
+        """
+        {
+          "rows": [
+            {"rank": 1, "seed": 10, "source_group": "all_fail"},
+            {"rank": 2, "seed": 20, "source_group": "candidate_hard_eval_seeds"},
+            {"rank": 3, "seed": 30, "source_group": "all_fail"}
+          ]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    seeds = load_hard_seed_candidates(path, ["all_fail", "candidate_hard_eval_seeds"])
+
+    assert seeds == [10, 30, 20]
+
+
+def test_collect_residual_replay_parses_inline_and_group_lists(tmp_path):
+    seed_list = tmp_path / "seeds.txt"
+    seed_list.write_text("1\n2\n", encoding="utf-8")
+    hard_json = tmp_path / "hard_seed_summary.json"
+    hard_json.write_text(
+        """
+        {
+          "all_fail": [2, 3],
+          "candidate_hard_eval_seeds": [3, 4]
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    assert parse_seed_list("5, 6 7") == [5, 6, 7]
+    assert parse_seed_list(str(seed_list)) == [1, 2]
+    assert load_hard_seed_candidates(hard_json, ["all_fail", "candidate_hard_eval_seeds"]) == [2, 3, 4]

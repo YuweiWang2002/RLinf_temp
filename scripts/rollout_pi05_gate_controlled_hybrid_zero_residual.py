@@ -6,8 +6,10 @@ import argparse
 import csv
 import json
 import os
+import sys
 import time
 import traceback
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,14 +19,25 @@ import torch
 
 from rlinf.algorithms.residual_td3.fk_bridge import AlohaFKBridge
 from rlinf.algorithms.residual_td3.gate_head import ChunkAwareGateRuntime
+from rlinf.algorithms.residual_td3.pregrasp_trigger import (
+    PregraspTriggerConfig,
+    PregraspTriggerResult,
+    choose_intervention_stage,
+    detect_pregrasp_trigger,
+)
 from rlinf.algorithms.residual_td3.residual_ee_intervention import (
     BCResidualActor,
     ConstantResidualActor,
     RandomNoiseResidualActor,
     ResidualEEInterventionConfig,
     ResidualEEInterventionRunner,
+    TD3ResidualActor,
     ZeroInitResidualActor,
     ZeroResidualActor,
+)
+from rlinf.algorithms.residual_td3.task_config import (
+    load_residual_task_config,
+    task_config_to_rollout_defaults,
 )
 from scripts.rollout_pi05_fk_ee16_zero_residual import (
     DEFAULT_CONFIG as DEFAULT_ENV_CONFIG,
@@ -52,11 +65,16 @@ from scripts.rollout_pi05_with_gate_logging import (
 )
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--task-config", default=None)
+    pre_args, _ = pre_parser.parse_known_args(argv)
+
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--task-config", default=None)
     parser.add_argument("--config", default="pi05_aloha_robotwin_handover")
     parser.add_argument("--env-config", default=DEFAULT_ENV_CONFIG)
-    parser.add_argument("--checkpoint", required=True)
+    parser.add_argument("--checkpoint", required=pre_args.task_config is None)
     parser.add_argument("--norm-stats-path", default=DEFAULT_NORM_STATS)
     parser.add_argument(
         "--chunk-aware-gate-checkpoint",
@@ -75,9 +93,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gate-chunk-len", "--gate_chunk_len", dest="gate_chunk_len", type=int, default=50)
     parser.add_argument(
         "--execution-mode",
-        choices=("qpos14_baseline", "gate_controlled_hybrid"),
+        choices=(
+            "qpos14_baseline",
+            "gate_controlled_hybrid",
+            "handover_only_k50",
+            "pregrasp_only_k50",
+            "pregrasp_plus_handover_k50",
+        ),
         default="gate_controlled_hybrid",
     )
+    parser.add_argument("--enable-pregrasp-intervention", action="store_true")
+    parser.add_argument(
+        "--gripper-close-direction",
+        choices=("lower", "higher"),
+        default=None,
+        help="Direction of numeric left-gripper closing for pregrasp trigger.",
+    )
+    parser.add_argument("--left-gripper-open-value", type=float, default=None)
+    parser.add_argument("--left-gripper-closed-value", type=float, default=None)
+    parser.add_argument("--gripper-close-threshold", type=float, default=None)
+    parser.add_argument("--gripper-closing-delta-threshold", type=float, default=0.15)
+    parser.add_argument("--pregrasp-cooldown-steps", type=int, default=50)
     parser.add_argument(
         "--enable-residual-intervention",
         "--enable_residual_intervention",
@@ -89,7 +125,7 @@ def parse_args() -> argparse.Namespace:
         "--residual_actor",
         "--residual-actor-type",
         dest="residual_actor",
-        choices=("zero", "constant", "zero_init", "bc", "random_noise"),
+        choices=("zero", "constant", "zero_init", "bc", "td3", "random_noise"),
         default="zero",
     )
     parser.add_argument("--residual-actor-checkpoint", default=None)
@@ -106,7 +142,7 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=(0.0, 0.0, 0.0),
     )
-    parser.add_argument("--residual-horizon-k", "--residual_horizon_k", dest="residual_horizon_k", type=int, default=10)
+    parser.add_argument("--residual-horizon-k", "--residual_horizon_k", dest="residual_horizon_k", type=int, default=50)
     parser.add_argument(
         "--residual-target-horizon-offset",
         "--residual_target_horizon_offset",
@@ -160,7 +196,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-eval-success-seeds", action="store_true")
     parser.add_argument("--task-name", default=None)
     parser.add_argument("--env-split", choices=("train", "eval"), default="eval")
-    parser.add_argument("--save-dir", required=True)
+    parser.add_argument("--save-dir", required=pre_args.task_config is None)
     parser.add_argument("--save-video", action="store_true")
     parser.add_argument(
         "--video-frame-mode",
@@ -191,7 +227,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--robotwin-assets-path", default=None)
     parser.add_argument("--robotwin-setup-max-retries", type=int, default=8)
     parser.add_argument("--debug-ee16-timing", action="store_true")
-    return parser.parse_args()
+    if pre_args.task_config:
+        task_cfg = load_residual_task_config(pre_args.task_config)
+        if task_cfg.missing_runtime_fields:
+            raise ValueError(
+                "--task-config is missing runtime fields: "
+                + ", ".join(task_cfg.missing_runtime_fields)
+            )
+        parser.set_defaults(**task_config_to_rollout_defaults(task_cfg))
+    args = parser.parse_args(argv)
+    if not hasattr(args, "task_config_missing_runtime_fields"):
+        args.task_config_missing_runtime_fields = []
+    return args
 
 
 def main() -> int:
@@ -216,13 +263,17 @@ def main() -> int:
         env.ee16_execution_strategy = args.ee16_execution_strategy
         model = load_model(build_actor_model_cfg(model_args), args.device)
         intervention_runner = None
-        if args.execution_mode == "gate_controlled_hybrid":
+        if ee_intervention_enabled(args):
             task = get_single_task_after_reset(env)
             intervention_runner = build_intervention_runner(task, args)
         metrics = run_episodes(env, model, gate_runtime, intervention_runner, args, episode_seeds)
         write_json(save_dir / "summary.json", metrics)
         print_summary(metrics)
-        return 0
+        close_env(env)
+        env = None
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
     except Exception as exc:  # noqa: BLE001
         print(f"HYBRID ROLLOUT: FAIL {type(exc).__name__}: {exc}")
         for line in traceback.format_exc().strip().splitlines()[-24:]:
@@ -264,10 +315,10 @@ def build_model_args(args: argparse.Namespace) -> SimpleNamespace:
 
 
 def load_gate_runtime(args: argparse.Namespace) -> ChunkAwareGateRuntime | None:
-    if args.execution_mode == "qpos14_baseline" and args.chunk_aware_gate_checkpoint is None:
+    if not handover_intervention_enabled(args) and args.chunk_aware_gate_checkpoint is None:
         return None
     if not args.chunk_aware_gate_checkpoint:
-        raise ValueError("--chunk-aware-gate-checkpoint is required for gate-controlled hybrid rollout.")
+        raise ValueError("--chunk-aware-gate-checkpoint is required for handover gate intervention.")
     return ChunkAwareGateRuntime.load_from_checkpoint(
         args.chunk_aware_gate_checkpoint,
         device=args.device,
@@ -288,6 +339,10 @@ def build_intervention_runner(task: Any, args: argparse.Namespace) -> ResidualEE
         if not args.residual_actor_checkpoint:
             raise ValueError("--residual-actor-checkpoint is required for --residual-actor bc.")
         actor = BCResidualActor.load_from_checkpoint(args.residual_actor_checkpoint, device=args.device)
+    elif args.residual_actor == "td3":
+        if not args.residual_actor_checkpoint:
+            raise ValueError("--residual-actor-checkpoint is required for --residual-actor td3.")
+        actor = TD3ResidualActor.load_from_checkpoint(args.residual_actor_checkpoint, device=args.device)
     elif args.residual_actor == "random_noise":
         actor = RandomNoiseResidualActor(
             noise_std=args.residual_noise_std,
@@ -313,6 +368,18 @@ def build_intervention_runner(task: Any, args: argparse.Namespace) -> ResidualEE
         actor,
         cfg,
     )
+
+
+def build_pregrasp_intervention_runner(
+    handover_runner: ResidualEEInterventionRunner,
+) -> ResidualEEInterventionRunner:
+    cfg = replace(
+        handover_runner.config,
+        dry_run=False,
+        learned_residual_control_enabled=False,
+        residual_scale=1.0,
+    )
+    return ResidualEEInterventionRunner(handover_runner.bridge, ZeroResidualActor(), cfg)
 
 
 def get_single_task_after_reset(env: Any) -> Any:
@@ -344,6 +411,11 @@ def run_episodes(
         "gate_chunk_len": args.gate_chunk_len,
         "chunk_aware_gate_checkpoint": args.chunk_aware_gate_checkpoint,
         "enable_residual_intervention": bool(args.enable_residual_intervention),
+        "enable_pregrasp_intervention": pregrasp_intervention_enabled(args),
+        "gripper_close_direction": args.gripper_close_direction,
+        "gripper_close_threshold": args.gripper_close_threshold,
+        "gripper_closing_delta_threshold": args.gripper_closing_delta_threshold,
+        "pregrasp_cooldown_steps": args.pregrasp_cooldown_steps,
         "residual_actor": args.residual_actor,
         "residual_actor_checkpoint": args.residual_actor_checkpoint,
         "residual_dry_run": resolve_residual_dry_run(args),
@@ -380,6 +452,9 @@ def run_episode(
     append_frame(frames, env, obs, args.video_source)
     rows: list[dict[str, Any]] = []
     intervention_records: list[dict[str, object]] = []
+    pregrasp_config = build_pregrasp_trigger_config(args)
+    pregrasp_runner = build_pregrasp_intervention_runner(intervention_runner) if intervention_runner else None
+    last_pregrasp_trigger_step: int | None = None
     episode_return = 0.0
     env_steps = 0
     replan_id = 0
@@ -398,27 +473,50 @@ def run_episode(
         qpos_exec_chunk = qpos_full[:, : args.chunk_len, :].contiguous()
         z_t = info["action_head_hidden"]
         gate_logit, gate_prob = compute_gate(gate_runtime, z_t, gate_action_chunk)
-        gate_binary = bool(args.execution_mode == "gate_controlled_hybrid" and gate_prob >= args.gate_threshold)
-        execution_mode = "ee16_zero_residual" if gate_binary else "qpos14"
+        handover_gate_binary = bool(handover_intervention_enabled(args) and gate_prob >= args.gate_threshold)
+        pregrasp_result = detect_pregrasp_trigger(
+            qpos_exec_chunk.detach().cpu().numpy(),
+            env_step=env_steps,
+            config=pregrasp_config,
+            last_trigger_step=last_pregrasp_trigger_step,
+        )
+        intervention_stage = choose_intervention_stage(
+            handover_gate=handover_gate_binary,
+            pregrasp_trigger=pregrasp_result.triggered,
+            enable_handover=handover_intervention_enabled(args),
+            enable_pregrasp=pregrasp_intervention_enabled(args),
+        )
+        gate_binary = intervention_stage == "handover"
+        ee16_binary = intervention_stage != "none"
+        execution_mode = "ee16_zero_residual" if ee16_binary else "qpos14"
         env_step_start = env_steps
 
-        env.robotwin_action_mode = "ee16" if gate_binary else "qpos14"
+        env.robotwin_action_mode = "ee16" if ee16_binary else "qpos14"
         env.ee16_execution_strategy = args.ee16_execution_strategy
         fk_time_s = 0.0
         residual_norm = 0.0
         right_xyz_movement_norm = 0.0
         intervention_meta: dict[str, object] = {}
-        if gate_binary:
-            if intervention_runner is None:
-                raise RuntimeError("gate-controlled hybrid mode requires a residual intervention runner.")
+        if ee16_binary:
+            active_runner = intervention_runner if intervention_stage == "handover" else pregrasp_runner
+            if active_runner is None:
+                raise RuntimeError("EE intervention mode requires a residual intervention runner.")
+            if intervention_stage == "pregrasp":
+                last_pregrasp_trigger_step = env_step_start
             fk_start = time.perf_counter()
-            intervention = intervention_runner.run(
+            trigger_source = "handover_gate" if intervention_stage == "handover" else "gripper_chunk"
+            intervention = active_runner.run(
                 qpos_exec_chunk.to(args.device),
                 gate_score=gate_prob,
                 gate_threshold=args.gate_threshold,
                 episode_id=episode_id,
                 env_step=env_step_start,
                 intervention_id=replan_id,
+                intervention_stage=intervention_stage,
+                trigger_source=trigger_source,
+                trigger_metadata=pregrasp_metadata(pregrasp_result)
+                if intervention_stage == "pregrasp"
+                else {},
             )
             fk_time_s = time.perf_counter() - fk_start
             env_action_chunk = intervention.exec_ee16_chunk.detach().cpu().numpy()
@@ -463,6 +561,9 @@ def run_episode(
             gate_logit=gate_logit,
             gate_prob=gate_prob,
             gate_binary=gate_binary,
+            handover_gate_binary=handover_gate_binary,
+            pregrasp_result=pregrasp_result,
+            intervention_stage=intervention_stage,
             execution_mode=execution_mode,
             args=args,
             qpos_chunk=qpos_exec_chunk,
@@ -481,7 +582,8 @@ def run_episode(
         rows.append(row)
         print(
             f"episode={episode_id} replan={replan_id} env_steps={env_steps} "
-            f"mode={execution_mode} gate_prob={gate_prob:.6g} return={episode_return:.6g} success={success}"
+            f"mode={execution_mode} stage={intervention_stage} gate_prob={gate_prob:.6g} "
+            f"pregrasp_score={pregrasp_result.score:.6g} return={episode_return:.6g} success={success}"
         )
         replan_id += 1
 
@@ -520,6 +622,12 @@ def run_episode(
         "first_intervention_step": first_intervention(rows, field="env_step_start"),
         "num_interventions": sum(1 for row in rows if row["execution_mode"] == "ee16_zero_residual"),
         "total_ee_intervention_steps": int(sum(row["num_intervention_steps"] for row in rows)),
+        "first_pregrasp_trigger_step": first_stage_intervention(rows, "pregrasp", field="env_step_start"),
+        "first_handover_trigger_step": first_stage_intervention(rows, "handover", field="env_step_start"),
+        "num_pregrasp_interventions": count_stage_interventions(rows, "pregrasp"),
+        "num_handover_interventions": count_stage_interventions(rows, "handover"),
+        "total_pregrasp_ee_steps": total_stage_ee_steps(rows, "pregrasp"),
+        "total_handover_ee_steps": total_stage_ee_steps(rows, "handover"),
         "pred_norm_mean": residual_stats["pred_norm_mean"],
         "pred_norm_std": residual_stats["pred_norm_std"],
         "pred_norm_max": residual_stats["pred_norm_max"],
@@ -546,6 +654,7 @@ def run_episode(
         "failure_reason": failure_reason(success, done, env_steps, args.max_steps),
         "simulator_crash": False,
         "execution_mode_timeline": [row["execution_mode"] for row in rows],
+        "intervention_stage_timeline": [row["intervention_stage"] for row in rows],
         "hybrid_log_path": str(log_path),
         "intervention_records_path": str(record_path),
         "gate_plot_path": str(plot_path) if plot_path is not None else None,
@@ -589,7 +698,9 @@ def execute_env_action_chunk(
 def build_hybrid_row(**kwargs: Any) -> dict[str, Any]:
     args = kwargs["args"]
     qpos_chunk = kwargs["qpos_chunk"]
+    left_gripper = qpos_chunk[0, :, 6].detach().cpu()
     right_gripper = qpos_chunk[0, :, 13].detach().cpu()
+    pregrasp_result: PregraspTriggerResult = kwargs["pregrasp_result"]
     row = {
         "episode_id": kwargs["episode_id"],
         "replan_id": kwargs["replan_id"],
@@ -600,7 +711,19 @@ def build_hybrid_row(**kwargs: Any) -> dict[str, Any]:
         "gate_logit": kwargs["gate_logit"],
         "gate_prob": kwargs["gate_prob"],
         "gate_binary": int(kwargs["gate_binary"]),
+        "handover_gate_binary": int(kwargs["handover_gate_binary"]),
+        "pregrasp_trigger_binary": int(pregrasp_result.triggered),
+        "pregrasp_trigger_score": pregrasp_result.score,
+        "first_closing_chunk_index": pregrasp_result.first_closing_chunk_index,
+        "left_gripper_start": pregrasp_result.left_gripper_start,
+        "left_gripper_end": pregrasp_result.left_gripper_end,
+        "left_gripper_min": pregrasp_result.left_gripper_min,
+        "left_gripper_max": pregrasp_result.left_gripper_max,
+        "pregrasp_trigger_reason": pregrasp_result.trigger_reason,
+        "pregrasp_trigger_in_cooldown": int(pregrasp_result.in_cooldown),
         "execution_mode": kwargs["execution_mode"],
+        "intervention_stage": kwargs["intervention_stage"],
+        "trigger_source": kwargs["intervention_meta"].get("trigger_source", ""),
         "ee16_execution_strategy": args.ee16_execution_strategy,
         "residual_actor": args.residual_actor,
         "residual_dry_run": resolve_residual_dry_run(args),
@@ -610,6 +733,9 @@ def build_hybrid_row(**kwargs: Any) -> dict[str, Any]:
         "residual_target_horizon_offset": args.residual_target_horizon_offset,
         "residual_max_delta_local_xyz": args.residual_max_delta_local_xyz,
         "qpos_action_norm": float(qpos_chunk.norm().detach().cpu()),
+        "action_chunk_left_gripper_min": float(left_gripper.min()),
+        "action_chunk_left_gripper_max": float(left_gripper.max()),
+        "action_chunk_left_gripper_mean": float(left_gripper.mean()),
         "action_chunk_right_gripper_min": float(right_gripper.min()),
         "action_chunk_right_gripper_max": float(right_gripper.max()),
         "action_chunk_right_gripper_mean": float(right_gripper.mean()),
@@ -691,6 +817,43 @@ def first_intervention(rows: list[dict[str, Any]], field: str = "env_step") -> i
         if row["execution_mode"] == "ee16_zero_residual":
             return int(row[field])
     return None
+
+
+def first_stage_intervention(rows: list[dict[str, Any]], stage: str, field: str = "env_step") -> int | None:
+    for row in rows:
+        if row.get("intervention_stage") == stage and row["execution_mode"] == "ee16_zero_residual":
+            return int(row[field])
+    return None
+
+
+def count_stage_interventions(rows: list[dict[str, Any]], stage: str) -> int:
+    return sum(
+        1
+        for row in rows
+        if row.get("intervention_stage") == stage and row["execution_mode"] == "ee16_zero_residual"
+    )
+
+
+def total_stage_ee_steps(rows: list[dict[str, Any]], stage: str) -> int:
+    return int(
+        sum(
+            row["num_intervention_steps"]
+            for row in rows
+            if row.get("intervention_stage") == stage and row["execution_mode"] == "ee16_zero_residual"
+        )
+    )
+
+
+def pregrasp_metadata(result: PregraspTriggerResult) -> dict[str, object]:
+    return {
+        "pregrasp_trigger_score": result.score,
+        "first_closing_chunk_index": result.first_closing_chunk_index,
+        "left_gripper_start": result.left_gripper_start,
+        "left_gripper_end": result.left_gripper_end,
+        "left_gripper_min": result.left_gripper_min,
+        "left_gripper_max": result.left_gripper_max,
+        "trigger_reason": result.trigger_reason,
+    }
 
 
 def residual_prediction_stats(records: list[dict[str, object]]) -> dict[str, float | int]:
@@ -841,6 +1004,13 @@ def validate_residual_control_args(args: argparse.Namespace) -> None:
         raise ValueError(
             "--residual-dry-run and --enable-learned-residual-control cannot be enabled together."
         )
+    if pregrasp_intervention_enabled(args) and getattr(args, "gripper_close_direction", None) is None:
+        raise ValueError("--gripper-close-direction is required for pregrasp intervention.")
+    if (
+        getattr(args, "left_gripper_closed_value", None) is not None
+        and getattr(args, "gripper_close_threshold", None) is None
+    ):
+        args.gripper_close_threshold = float(args.left_gripper_closed_value)
 
 
 def resolve_residual_control_flags(args: argparse.Namespace) -> dict[str, bool]:
@@ -860,5 +1030,42 @@ def learned_residual_control_enabled(args: argparse.Namespace) -> bool:
     return bool(resolve_residual_control_flags(args)["learned_residual_control_enabled"])
 
 
+def handover_intervention_enabled(args: argparse.Namespace) -> bool:
+    return getattr(args, "execution_mode", "gate_controlled_hybrid") in {
+        "gate_controlled_hybrid",
+        "handover_only_k50",
+        "pregrasp_plus_handover_k50",
+    }
+
+
+def pregrasp_intervention_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "enable_pregrasp_intervention", False)) or getattr(
+        args, "execution_mode", "gate_controlled_hybrid"
+    ) in {
+        "pregrasp_only_k50",
+        "pregrasp_plus_handover_k50",
+    }
+
+
+def ee_intervention_enabled(args: argparse.Namespace) -> bool:
+    return handover_intervention_enabled(args) or pregrasp_intervention_enabled(args)
+
+
+def build_pregrasp_trigger_config(args: argparse.Namespace) -> PregraspTriggerConfig:
+    close_threshold = getattr(args, "gripper_close_threshold", None)
+    if close_threshold is None:
+        close_threshold = getattr(args, "left_gripper_closed_value", None)
+    return PregraspTriggerConfig(
+        enabled=pregrasp_intervention_enabled(args),
+        close_direction=getattr(args, "gripper_close_direction", None),
+        close_threshold=close_threshold,
+        closing_delta_threshold=getattr(args, "gripper_closing_delta_threshold", 0.15),
+        cooldown_steps=getattr(args, "pregrasp_cooldown_steps", 50),
+    )
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(exit_code)

@@ -27,7 +27,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--target-dataset", required=True)
     parser.add_argument("--output-dir", required=True)
-    parser.add_argument("--residual-horizon-k", type=int, default=10)
+    parser.add_argument("--residual-horizon-k", type=int, default=50)
     parser.add_argument("--delta-max", type=float, default=0.05)
     parser.add_argument("--hidden-dim", type=int, default=256)
     parser.add_argument("--batch-size", type=int, default=1024)

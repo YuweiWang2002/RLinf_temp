@@ -32,7 +32,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pi05-action-cache-dir", default=None)
     parser.add_argument("--chunk-len", type=int, default=50)
-    parser.add_argument("--residual-horizon-k", type=int, default=10)
+    parser.add_argument("--residual-horizon-k", type=int, default=50)
     parser.add_argument("--target-horizon-offsets", default="0,1,2")
     parser.add_argument("--max-delta-local-xyz", type=float, default=0.05)
     parser.add_argument("--gate-positive-only", action=argparse.BooleanOptionalAction, default=True)

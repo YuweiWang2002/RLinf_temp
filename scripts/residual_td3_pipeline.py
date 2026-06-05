@@ -1,0 +1,310 @@
+"""Thin residual TD3 pipeline wrapper around the current prototype scripts."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+LOG_ROOT = REPO_ROOT / "logs" / "residual_td3"
+
+
+def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[str]]:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="subcommand", required=True)
+    for name in ("rollout-eval", "collect-replay", "train-td3"):
+        subparser = subparsers.add_parser(name)
+        add_common_args(subparser)
+        if name == "rollout-eval":
+            add_rollout_args(subparser)
+        elif name == "collect-replay":
+            add_collect_args(subparser)
+        elif name == "train-td3":
+            add_train_td3_args(subparser)
+    return parser.parse_known_args(argv)
+
+
+def add_common_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--task-config", required=True)
+    parser.add_argument("--run-name", required=True)
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Write metadata and print the wrapped command without executing it.",
+    )
+
+
+def add_rollout_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--execution-mode", default=None)
+    parser.add_argument("--num-episodes", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--device", default=None)
+
+
+def add_collect_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--action-source", choices=("zero", "bc", "random_noise"), default=None)
+    parser.add_argument("--num-episodes", type=int, default=None)
+    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--device", default=None)
+
+
+def add_train_td3_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--replay", default=None)
+    parser.add_argument("--bc-actor-checkpoint", default=None)
+    parser.add_argument("--updates", type=int, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--device", default=None)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args, passthrough = parse_args(argv)
+    passthrough = normalize_passthrough(passthrough)
+    try:
+        task_cfg = load_task_config(args.task_config)
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    task_name = require_task_name(task_cfg)
+    output_dir = output_dir_for(task_name, args.subcommand, args.run_name)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    command = build_wrapped_command(args, task_cfg, output_dir, passthrough)
+    write_run_metadata(output_dir, args, task_cfg, command, passthrough)
+    if args.dry_run:
+        print(json.dumps({"output_dir": str(output_dir), "command": command}, indent=2))
+        return 0
+    completed = subprocess.run(command, cwd=REPO_ROOT, env=subprocess_env())
+    return int(completed.returncode)
+
+
+def output_dir_for(task_name: str, subcommand: str, run_name: str) -> Path:
+    return LOG_ROOT / task_name / subcommand / run_name
+
+
+def subprocess_env() -> dict[str, str]:
+    env = dict(os.environ)
+    repo_root = str(REPO_ROOT)
+    existing = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = repo_root if not existing else repo_root + os.pathsep + existing
+    env.setdefault("REPO_PATH", repo_root)
+    return env
+
+
+def normalize_passthrough(passthrough: list[str]) -> list[str]:
+    return [arg for arg in passthrough if arg != "--"]
+
+
+def build_wrapped_command(
+    args: argparse.Namespace,
+    task_cfg: Any,
+    output_dir: Path,
+    passthrough: list[str],
+) -> list[str]:
+    if args.subcommand == "rollout-eval":
+        command = [
+            sys.executable,
+            "scripts/rollout_pi05_gate_controlled_hybrid_zero_residual.py",
+            "--task-config",
+            str(task_cfg.path),
+            "--save-dir",
+            str(output_dir),
+        ]
+        append_optional(command, "--execution-mode", args.execution_mode)
+        append_optional(command, "--num-episodes", args.num_episodes)
+        append_optional(command, "--max-steps", args.max_steps)
+        append_optional(command, "--seed", args.seed)
+        append_optional(command, "--device", args.device)
+        return command + passthrough
+
+    if args.subcommand == "collect-replay":
+        defaults = task_config_to_script_defaults(task_cfg)
+        command = [
+            sys.executable,
+            "scripts/collect_residual_replay.py",
+            "--config",
+            defaults["config"],
+            "--env-config",
+            defaults["env_config"],
+            "--checkpoint",
+            defaults["checkpoint"],
+            "--norm-stats-path",
+            defaults["norm_stats_path"],
+            "--chunk-aware-gate-checkpoint",
+            defaults["chunk_aware_gate_checkpoint"],
+            "--save-dir",
+            str(output_dir),
+            "--rollout-save-dir",
+            str(output_dir / "rollout"),
+            "--action-source",
+            str(args.action_source or get_path(task_cfg.data, "replay.action_source") or "zero"),
+        ]
+        append_optional(command, "--task-name", get_path(task_cfg.data, "task.robotwin_task_name"))
+        append_optional(command, "--gate-threshold", get_path(task_cfg.data, "gates.chunk_aware.threshold"))
+        append_optional(command, "--gate-chunk-len", get_path(task_cfg.data, "gates.chunk_aware.chunk_len"))
+        append_optional(command, "--residual-scale", get_path(task_cfg.data, "intervention.residual.scale"))
+        append_optional(command, "--residual-horizon-k", get_path(task_cfg.data, "intervention.horizon_k"))
+        append_optional(
+            command,
+            "--residual-max-delta-local-xyz",
+            get_path(task_cfg.data, "intervention.delta_max"),
+        )
+        append_optional(command, "--num-episodes", args.num_episodes)
+        append_optional(command, "--max-steps", args.max_steps)
+        append_optional(command, "--seed", args.seed)
+        append_optional(command, "--device", args.device)
+        return command + passthrough
+
+    if args.subcommand == "train-td3":
+        command = [
+            sys.executable,
+            "scripts/train_residual_td3_from_replay.py",
+            "--output-dir",
+            str(output_dir),
+        ]
+        append_optional(command, "--replay", args.replay)
+        append_optional(command, "--bc-actor-checkpoint", args.bc_actor_checkpoint)
+        append_optional(command, "--updates", args.updates)
+        append_optional(command, "--batch-size", args.batch_size)
+        append_optional(command, "--device", args.device)
+        return command + passthrough
+
+    raise ValueError(f"Unsupported subcommand: {args.subcommand}")
+
+
+def task_config_to_script_defaults(task_cfg: Any) -> dict[str, str]:
+    values = {
+        "config": get_path(task_cfg.data, "pi05.config"),
+        "env_config": get_path(task_cfg.data, "robotwin.env_config"),
+        "checkpoint": get_path(task_cfg.data, "pi05.checkpoint"),
+        "norm_stats_path": get_path(task_cfg.data, "pi05.norm_stats_path"),
+        "chunk_aware_gate_checkpoint": get_path(task_cfg.data, "gates.chunk_aware.checkpoint"),
+    }
+    missing = [key for key, value in values.items() if is_missing(value)]
+    if missing:
+        raise ValueError(f"Task config is missing runtime fields for wrapper: {missing}")
+    return {key: str(value) for key, value in values.items()}
+
+
+def append_optional(command: list[str], flag: str, value: Any) -> None:
+    if value is not None:
+        command.extend([flag, str(value)])
+
+
+def write_run_metadata(
+    output_dir: Path,
+    args: argparse.Namespace,
+    task_cfg: Any,
+    command: list[str],
+    passthrough: list[str],
+) -> None:
+    write_config_snapshot(task_cfg.path, output_dir / "config_snapshot.yaml")
+    (output_dir / "command.txt").write_text(" ".join(sys.argv) + "\n", encoding="utf-8")
+    (output_dir / "git_commit.txt").write_text(git_commit_text(), encoding="utf-8")
+    write_json(output_dir / "seed_info.json", seed_info(args, task_cfg))
+    write_json(
+        output_dir / "run_metadata.json",
+        {
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "subcommand": args.subcommand,
+            "task_config": str(task_cfg.path),
+            "task_name": require_task_name(task_cfg),
+            "run_name": args.run_name,
+            "output_dir": str(output_dir),
+            "wrapped_command": command,
+            "passthrough_args": passthrough,
+            "dry_run": bool(args.dry_run),
+        },
+    )
+
+
+def write_config_snapshot(src: Path, dst: Path) -> None:
+    shutil.copyfile(src, dst)
+
+
+def seed_info(args: argparse.Namespace, task_cfg: Any) -> dict[str, Any]:
+    return {
+        "seed": getattr(args, "seed", None) or get_path(task_cfg.data, "replay.seed"),
+        "seed_list": get_path(task_cfg.data, "replay.seed_list"),
+        "hard_seed_set": get_path(task_cfg.data, "replay.hard_seed_set"),
+    }
+
+
+def git_commit_text() -> str:
+    commit = run_git(["rev-parse", "HEAD"])
+    status = run_git(["status", "--short"])
+    dirty = "dirty" if status.strip() else "clean"
+    return f"{commit.strip()}\n{dirty}\n"
+
+
+def run_git(args: list[str]) -> str:
+    try:
+        completed = subprocess.run(
+            ["git", *args],
+            cwd=REPO_ROOT,
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:
+        return f"unavailable: {exc}"
+    if completed.returncode != 0:
+        return f"unavailable: {completed.stderr.strip()}"
+    return completed.stdout
+
+
+def write_json(path: Path, data: dict[str, Any]) -> None:
+    path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def load_task_config(path: str) -> Any:
+    config_path = Path(path)
+    if not config_path.exists():
+        raise FileNotFoundError(f"Task config not found: {config_path}")
+    module = load_task_config_module()
+    return module.load_residual_task_config(config_path)
+
+
+def load_task_config_module() -> Any:
+    import importlib.util
+
+    module_path = REPO_ROOT / "rlinf" / "algorithms" / "residual_td3" / "task_config.py"
+    spec = importlib.util.spec_from_file_location("_residual_task_config", module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Cannot load task config module from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def require_task_name(task_cfg: Any) -> str:
+    task_name = get_path(task_cfg.data, "task.name")
+    if is_missing(task_name):
+        raise ValueError(f"Task config is missing task.name: {task_cfg.path}")
+    return str(task_name)
+
+
+def get_path(cfg: dict[str, Any], dotted_path: str) -> Any:
+    value: Any = cfg
+    for key in dotted_path.split("."):
+        if not isinstance(value, dict) or key not in value:
+            return None
+        value = value[key]
+    return value
+
+
+def is_missing(value: Any) -> bool:
+    return value is None or value == "TODO"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
