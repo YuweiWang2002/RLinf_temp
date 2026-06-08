@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import json
 import os
 import shutil
@@ -13,6 +14,9 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 LOG_ROOT = REPO_ROOT / "logs" / "residual_td3"
 
 
@@ -34,6 +38,11 @@ def parse_args(argv: list[str] | None = None) -> tuple[argparse.Namespace, list[
 def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--task-config", required=True)
     parser.add_argument("--run-name", required=True)
+    parser.add_argument(
+        "--mock-runtime",
+        action="store_true",
+        help="Write no-GPU mock artifacts instead of launching real env/model scripts.",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -81,6 +90,10 @@ def main(argv: list[str] | None = None) -> int:
     write_run_metadata(output_dir, args, task_cfg, command, passthrough)
     if args.dry_run:
         print(json.dumps({"output_dir": str(output_dir), "command": command}, indent=2))
+        return 0
+    if args.mock_runtime and args.subcommand in {"rollout-eval", "collect-replay"}:
+        summary = run_mock_subcommand(args, task_cfg, output_dir)
+        print(json.dumps({"output_dir": str(output_dir), "mock_runtime": True, "summary": summary}, indent=2))
         return 0
     completed = subprocess.run(command, cwd=REPO_ROOT, env=subprocess_env())
     return int(completed.returncode)
@@ -164,6 +177,11 @@ def build_wrapped_command(
         return command + passthrough
 
     if args.subcommand == "train-td3":
+        bc_actor_checkpoint = args.bc_actor_checkpoint
+        if bc_actor_checkpoint is None:
+            bc_actor_checkpoint = str(
+                mock_runtime_module().ensure_mock_bc_actor_checkpoint(output_dir / "mock_bc_actor.pt")
+            )
         command = [
             sys.executable,
             "scripts/train_residual_td3_from_replay.py",
@@ -171,7 +189,7 @@ def build_wrapped_command(
             str(output_dir),
         ]
         append_optional(command, "--replay", args.replay)
-        append_optional(command, "--bc-actor-checkpoint", args.bc_actor_checkpoint)
+        append_optional(command, "--bc-actor-checkpoint", bc_actor_checkpoint)
         append_optional(command, "--updates", args.updates)
         append_optional(command, "--batch-size", args.batch_size)
         append_optional(command, "--device", args.device)
@@ -199,6 +217,36 @@ def append_optional(command: list[str], flag: str, value: Any) -> None:
         command.extend([flag, str(value)])
 
 
+def run_mock_subcommand(args: argparse.Namespace, task_cfg: Any, output_dir: Path) -> dict[str, Any]:
+    mock_runtime = mock_runtime_module()
+    seed = int(args.seed or get_path(task_cfg.data, "replay.seed") or 100100000)
+    num_episodes = int(args.num_episodes or get_path(task_cfg.data, "eval.num_episodes") or 1)
+    max_steps = int(args.max_steps or get_path(task_cfg.data, "replay.max_steps") or 100)
+    if args.subcommand == "rollout-eval":
+        return mock_runtime.write_mock_rollout_eval(
+            output_dir,
+            execution_mode=str(args.execution_mode or "handover_only_k50"),
+            num_episodes=num_episodes,
+            max_steps=max_steps,
+            seed=seed,
+            gate_threshold=float(get_path(task_cfg.data, "gates.chunk_aware.threshold") or 0.6),
+            residual_horizon_k=int(get_path(task_cfg.data, "intervention.horizon_k") or 50),
+        )
+    if args.subcommand == "collect-replay":
+        return mock_runtime.write_mock_collect_replay(
+            output_dir,
+            action_source=str(args.action_source or get_path(task_cfg.data, "replay.action_source") or "zero"),
+            num_episodes=num_episodes,
+            max_steps=max_steps,
+            seed=seed,
+        )
+    raise ValueError(f"mock runtime does not support subcommand: {args.subcommand}")
+
+
+def mock_runtime_module() -> Any:
+    return importlib.import_module("rlinf.algorithms.residual_td3.mock_runtime")
+
+
 def write_run_metadata(
     output_dir: Path,
     args: argparse.Namespace,
@@ -222,6 +270,9 @@ def write_run_metadata(
             "wrapped_command": command,
             "passthrough_args": passthrough,
             "dry_run": bool(args.dry_run),
+            "mock_runtime": bool(args.mock_runtime),
+            "real_env": not bool(args.mock_runtime),
+            "real_model": not bool(args.mock_runtime),
         },
     )
 

@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from scripts import residual_td3_pipeline as pipeline
@@ -74,6 +75,7 @@ def test_pipeline_dry_run_writes_metadata(tmp_path, monkeypatch):
     assert metadata["task_name"] == "handover_block"
     assert metadata["subcommand"] == "rollout-eval"
     assert metadata["dry_run"]
+    assert metadata["mock_runtime"] is False
 
 
 def test_pipeline_missing_task_config_has_clear_error(capsys):
@@ -117,3 +119,127 @@ def test_collect_replay_command_uses_unified_output_dir():
 def test_load_task_config_raises_for_missing_file():
     with pytest.raises(FileNotFoundError, match="Task config not found"):
         pipeline.load_task_config("configs/residual_td3/tasks/does_not_exist.yaml")
+
+
+def test_mock_rollout_eval_writes_summary_without_subprocess(tmp_path, monkeypatch):
+    real_subprocess_run = pipeline.subprocess.run
+
+    def fail_subprocess(*args, **kwargs):
+        command = args[0] if args else kwargs.get("args", [])
+        if command and command[0] == "git":
+            return real_subprocess_run(*args, **kwargs)
+        raise AssertionError("mock runtime must not launch wrapped rollout subprocess")
+
+    monkeypatch.setattr(pipeline, "LOG_ROOT", tmp_path)
+    monkeypatch.setattr(pipeline.subprocess, "run", fail_subprocess)
+
+    code = pipeline.main(
+        [
+            "rollout-eval",
+            "--task-config",
+            TASK_CONFIG,
+            "--run-name",
+            "mock_rollout",
+            "--execution-mode",
+            "handover_only_k50",
+            "--num-episodes",
+            "2",
+            "--max-steps",
+            "100",
+            "--mock-runtime",
+        ]
+    )
+
+    out_dir = tmp_path / "handover_block" / "rollout-eval" / "mock_rollout"
+    summary = json.loads((out_dir / "summary.json").read_text())
+    metadata = json.loads((out_dir / "run_metadata.json").read_text())
+    assert code == 0
+    assert summary["mock_runtime"] is True
+    assert summary["real_env"] is False
+    assert summary["real_model"] is False
+    assert len(summary["episodes"]) == 2
+    assert (out_dir / "hybrid_log_episode_0000.parquet").exists()
+    assert (out_dir / "intervention_records_episode_0000.parquet").exists()
+    assert metadata["mock_runtime"] is True
+
+
+def test_mock_collect_replay_writes_expected_npz_shapes(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "LOG_ROOT", tmp_path)
+
+    code = pipeline.main(
+        [
+            "collect-replay",
+            "--task-config",
+            TASK_CONFIG,
+            "--run-name",
+            "mock_collect",
+            "--action-source",
+            "zero",
+            "--num-episodes",
+            "2",
+            "--max-steps",
+            "100",
+            "--mock-runtime",
+        ]
+    )
+
+    out_dir = tmp_path / "handover_block" / "collect-replay" / "mock_collect"
+    assert code == 0
+    assert (out_dir / "episodes_summary.csv").exists()
+    assert (out_dir / "reward_summary.json").exists()
+    assert (out_dir / "config.json").exists()
+    with np.load(out_dir / "replay.npz") as replay:
+        assert replay["obs"].shape[1:] == (21,)
+        assert replay["action"].shape[1:] == (3,)
+        assert replay["next_obs"].shape[1:] == (21,)
+        assert replay["reward"].shape == replay["done"].shape
+        assert replay["obs"].shape[0] > 0
+    reward_summary = json.loads((out_dir / "reward_summary.json").read_text())
+    assert reward_summary["mock_runtime"] is True
+
+
+def test_mock_train_td3_cpu_runs_from_mock_replay(tmp_path, monkeypatch):
+    monkeypatch.setattr(pipeline, "LOG_ROOT", tmp_path)
+    collect_code = pipeline.main(
+        [
+            "collect-replay",
+            "--task-config",
+            TASK_CONFIG,
+            "--run-name",
+            "mock_collect_train",
+            "--action-source",
+            "zero",
+            "--num-episodes",
+            "1",
+            "--max-steps",
+            "50",
+            "--mock-runtime",
+        ]
+    )
+    replay_path = tmp_path / "handover_block" / "collect-replay" / "mock_collect_train" / "replay.npz"
+
+    train_code = pipeline.main(
+        [
+            "train-td3",
+            "--task-config",
+            TASK_CONFIG,
+            "--run-name",
+            "mock_train",
+            "--replay",
+            str(replay_path),
+            "--updates",
+            "2",
+            "--batch-size",
+            "4",
+            "--device",
+            "cpu",
+        ]
+    )
+
+    out_dir = tmp_path / "handover_block" / "train-td3" / "mock_train"
+    assert collect_code == 0
+    assert train_code == 0
+    assert (out_dir / "actor_td3.pt").exists()
+    assert (out_dir / "critic_td3.pt").exists()
+    assert (out_dir / "metrics.csv").exists()
+    assert (out_dir / "summary.json").exists()

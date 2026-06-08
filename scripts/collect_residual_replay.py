@@ -14,24 +14,20 @@ from rlinf.algorithms.residual_td3.residual_replay import (
     load_intervention_records,
     save_replay_artifacts,
 )
+from rlinf.algorithms.residual_td3.rollout_runtime import (
+    RolloutRuntimeFactory,
+    build_collect_replay_rollout_args,
+)
 from scripts.rollout_pi05_fk_ee16_zero_residual import (
     DEFAULT_CONFIG as DEFAULT_ENV_CONFIG,
 )
+from scripts.rollout_pi05_fk_ee16_zero_residual import (
+    select_episode_seeds,
+)
 from scripts.rollout_pi05_gate_controlled_hybrid_zero_residual import (
     bootstrap_robotwin_runtime,
-    build_actor_model_cfg,
-    build_env_args,
-    build_intervention_runner,
-    build_model_args,
-    close_env,
     configure_line_buffering,
-    get_single_task_after_reset,
-    load_env_cfg,
-    load_gate_runtime,
-    load_model,
-    make_env,
     run_episodes,
-    select_episode_seeds,
 )
 from scripts.rollout_pi05_with_gate_logging import DEFAULT_NORM_STATS
 
@@ -110,33 +106,22 @@ def main() -> int:
     if args.action_source == "bc" and not args.residual_actor_checkpoint:
         raise ValueError("--residual-actor-checkpoint is required for --action-source=bc.")
 
-    rollout_args = build_rollout_args(args)
-    env = None
+    rollout_args = build_collect_replay_rollout_args(args)
+    runtime = None
     try:
         out_dir = Path(args.save_dir)
         rollout_dir = Path(rollout_args.save_dir)
         out_dir.mkdir(parents=True, exist_ok=True)
         rollout_dir.mkdir(parents=True, exist_ok=True)
 
-        env_args = build_env_args(rollout_args)
-        model_args = build_model_args(rollout_args)
-        env_cfg = load_env_cfg(env_args)
-        if hasattr(env_cfg.task_config, "planner_backend"):
-            env_cfg.task_config.planner_backend = rollout_args.planner_backend
-        gate_runtime = load_gate_runtime(rollout_args)
-        env = make_env(env_cfg)
-        env.debug_ee16_timing = False
-        env.ee16_execution_strategy = rollout_args.ee16_execution_strategy
-        model = load_model(build_actor_model_cfg(model_args), rollout_args.device)
-        task = get_single_task_after_reset(env)
-        intervention_runner = build_intervention_runner(task, rollout_args)
-        episode_seeds = resolve_episode_seeds(args, env_cfg, env_args)
+        runtime = RolloutRuntimeFactory(rollout_args).create(debug_ee16_timing=False)
+        episode_seeds = resolve_episode_seeds(args, runtime.env_cfg, runtime.env_args)
         rollout_args.num_episodes = len(episode_seeds)
         rollout_summary = run_episodes(
-            env,
-            model,
-            gate_runtime,
-            intervention_runner,
+            runtime.env,
+            runtime.model,
+            runtime.gate_runtime,
+            runtime.intervention_runner,
             rollout_args,
             episode_seeds,
         )
@@ -172,77 +157,8 @@ def main() -> int:
         print(json.dumps({"reward_summary": reward_summary, "paths": paths}, indent=2))
         return 0
     finally:
-        if env is not None:
-            close_env(env)
-
-
-def build_rollout_args(args: argparse.Namespace) -> SimpleNamespace:
-    """Build the rollout namespace expected by the hybrid rollout helpers."""
-
-    rollout_save_dir = args.rollout_save_dir or str(Path(args.save_dir) / "rollout")
-    residual_actor = "random_noise" if args.action_source == "random_noise" else args.action_source
-    return SimpleNamespace(
-        config=args.config,
-        env_config=args.env_config,
-        checkpoint=args.checkpoint,
-        norm_stats_path=args.norm_stats_path,
-        chunk_aware_gate_checkpoint=args.chunk_aware_gate_checkpoint,
-        gate_type="chunk_aware",
-        gate_threshold=args.gate_threshold,
-        gate_chunk_len=args.gate_chunk_len,
-        execution_mode="gate_controlled_hybrid",
-        task_config=None,
-        task_config_missing_runtime_fields=[],
-        enable_pregrasp_intervention=False,
-        gripper_close_direction=None,
-        left_gripper_open_value=None,
-        left_gripper_closed_value=None,
-        gripper_close_threshold=None,
-        gripper_closing_delta_threshold=0.15,
-        pregrasp_cooldown_steps=50,
-        enable_residual_intervention=True,
-        residual_actor=residual_actor,
-        residual_actor_checkpoint=args.residual_actor_checkpoint,
-        residual_dry_run=False,
-        residual_scale=args.residual_scale,
-        residual_noise_std=args.residual_noise_std,
-        log_bc_residual_predictions=True,
-        enable_learned_residual_control=True,
-        residual_constant_delta_local_xyz=(0.0, 0.0, 0.0),
-        residual_horizon_k=args.residual_horizon_k,
-        residual_target_horizon_offset=args.residual_target_horizon_offset,
-        residual_max_delta_local_xyz=args.residual_max_delta_local_xyz,
-        left_stabilization_mode="none",
-        left_deadband_xyz=1e-4,
-        left_lowpass_alpha=0.5,
-        ee16_execution_strategy=args.ee16_execution_strategy,
-        num_episodes=args.num_episodes,
-        max_steps=args.max_steps,
-        chunk_len=args.chunk_len,
-        model_num_action_chunks=args.model_num_action_chunks,
-        seed=args.seed,
-        seed_offset=args.seed_offset,
-        use_eval_success_seeds=args.use_eval_success_seeds,
-        task_name=args.task_name,
-        env_split=args.env_split,
-        save_dir=rollout_save_dir,
-        save_video=args.save_video,
-        video_frame_mode=args.video_frame_mode,
-        save_debug=args.save_debug,
-        save_gate_plots=False,
-        video_fps=args.video_fps,
-        video_source=args.video_source,
-        device=args.device,
-        num_images_in_input=args.num_images_in_input,
-        noise_level=args.noise_level,
-        planner_backend=args.planner_backend,
-        robotwin_runtime_bootstrap=args.robotwin_runtime_bootstrap,
-        robotwin_path=args.robotwin_path,
-        curobo_src_path=args.curobo_src_path,
-        robotwin_assets_path=args.robotwin_assets_path,
-        robotwin_setup_max_retries=args.robotwin_setup_max_retries,
-        debug_ee16_timing=False,
-    )
+        if runtime is not None:
+            runtime.close()
 
 
 def resolve_episode_seeds(args: argparse.Namespace, env_cfg: object, env_args: SimpleNamespace) -> list[int]:

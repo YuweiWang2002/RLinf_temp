@@ -9,7 +9,6 @@ import sys
 import time
 import traceback
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -30,20 +29,26 @@ from rlinf.algorithms.residual_td3.pregrasp_trigger import (
     detect_pregrasp_trigger,
 )
 from rlinf.algorithms.residual_td3.residual_actor_runtime import (
-    build_intervention_runner_from_args,
-)
-from rlinf.algorithms.residual_td3.residual_actor_runtime import (
     build_pregrasp_intervention_runner as build_pregrasp_runner_from_handover,
 )
 from rlinf.algorithms.residual_td3.residual_ee_intervention import (
     ResidualEEInterventionRunner,
 )
 from rlinf.algorithms.residual_td3.rollout_engine import ResidualRolloutEngine
+from rlinf.algorithms.residual_td3.rollout_runtime import (
+    RolloutRuntimeFactory,
+    handover_intervention_enabled,
+    learned_residual_control_enabled,
+    pregrasp_intervention_enabled,
+    resolve_residual_dry_run,
+    validate_residual_control_args,
+)
+from rlinf.algorithms.residual_td3.rollout_runtime import (
+    resolve_residual_control_flags as _resolve_residual_control_flags,
+)
 from rlinf.algorithms.residual_td3.stage_decision import (
     InterventionStage,
     decide_execution_plan,
-    handover_intervention_enabled_for_mode,
-    pregrasp_intervention_enabled_for_mode,
 )
 from rlinf.algorithms.residual_td3.task_config import (
     load_residual_task_config,
@@ -55,17 +60,11 @@ from scripts.rollout_pi05_fk_ee16_zero_residual import (
 from scripts.rollout_pi05_fk_ee16_zero_residual import (
     append_frame,
     bootstrap_robotwin_runtime,
-    build_actor_model_cfg,
-    close_env,
     configure_line_buffering,
     get_single_task,
-    load_env_cfg,
-    load_model,
-    make_env,
     read_pose16,
     read_task_qpos14,
     save_video,
-    select_episode_seeds,
     to_numpy,
 )
 from scripts.rollout_pi05_with_gate_logging import (
@@ -257,30 +256,23 @@ def main() -> int:
     bootstrap_robotwin_runtime(args)
     validate_residual_control_args(args)
     print_context(args)
-    env = None
+    runtime = None
     try:
         save_dir = Path(args.save_dir)
         save_dir.mkdir(parents=True, exist_ok=True)
-        env_args = build_env_args(args)
-        model_args = build_model_args(args)
-        env_cfg = load_env_cfg(env_args)
-        if args.execution_mode == "gate_controlled_hybrid" and hasattr(env_cfg.task_config, "planner_backend"):
-            env_cfg.task_config.planner_backend = args.planner_backend
-        episode_seeds = select_episode_seeds(env_cfg, env_args)
-        gate_runtime = load_gate_runtime(args)
-        env = make_env(env_cfg)
-        env.debug_ee16_timing = bool(args.debug_ee16_timing)
-        env.ee16_execution_strategy = args.ee16_execution_strategy
-        model = load_model(build_actor_model_cfg(model_args), args.device)
-        intervention_runner = None
-        if ee_intervention_enabled(args):
-            task = get_single_task_after_reset(env)
-            intervention_runner = build_intervention_runner(task, args)
-        metrics = run_episodes(env, model, gate_runtime, intervention_runner, args, episode_seeds)
+        runtime = RolloutRuntimeFactory(args).create()
+        metrics = run_episodes(
+            runtime.env,
+            runtime.model,
+            runtime.gate_runtime,
+            runtime.intervention_runner,
+            args,
+            runtime.episode_seeds,
+        )
         write_json(save_dir / "summary.json", metrics)
         print_summary(metrics)
-        close_env(env)
-        env = None
+        runtime.close()
+        runtime = None
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)
@@ -290,69 +282,14 @@ def main() -> int:
             print(f"  {line}")
         return 1
     finally:
-        if env is not None:
-            close_env(env)
-
-
-def build_env_args(args: argparse.Namespace) -> SimpleNamespace:
-    return SimpleNamespace(
-        config=args.env_config,
-        env_split=args.env_split,
-        task_name=args.task_name,
-        seed=args.seed,
-        seed_offset=args.seed_offset,
-        num_episodes=args.num_episodes,
-        max_steps=args.max_steps,
-        chunk_len=args.chunk_len,
-        use_eval_success_seeds=args.use_eval_success_seeds,
-        save_video=args.save_video,
-        save_dir=args.save_dir,
-        data_dir=str(Path(args.save_dir) / "data"),
-        execution_mode="qpos14",
-        robotwin_assets_path=args.robotwin_assets_path,
-    )
-
-
-def build_model_args(args: argparse.Namespace) -> SimpleNamespace:
-    return SimpleNamespace(
-        checkpoint=args.checkpoint,
-        norm_stats_path=args.norm_stats_path,
-        model_num_action_chunks=args.model_num_action_chunks,
-        config_name=args.config,
-        num_images_in_input=args.num_images_in_input,
-        noise_level=args.noise_level,
-    )
-
-
-def load_gate_runtime(args: argparse.Namespace) -> ChunkAwareGateRuntime | None:
-    if not handover_intervention_enabled(args) and args.chunk_aware_gate_checkpoint is None:
-        return None
-    if not args.chunk_aware_gate_checkpoint:
-        raise ValueError("--chunk-aware-gate-checkpoint is required for handover gate intervention.")
-    return ChunkAwareGateRuntime.load_from_checkpoint(
-        args.chunk_aware_gate_checkpoint,
-        device=args.device,
-        threshold=args.gate_threshold,
-    )
-
-
-def build_intervention_runner(task: Any, args: argparse.Namespace) -> ResidualEEInterventionRunner:
-    return build_intervention_runner_from_args(
-        task,
-        args,
-        resolve_residual_control_flags(args),
-    )
+        if runtime is not None:
+            runtime.close()
 
 
 def build_pregrasp_intervention_runner(
     handover_runner: ResidualEEInterventionRunner,
 ) -> ResidualEEInterventionRunner:
     return build_pregrasp_runner_from_handover(handover_runner)
-
-
-def get_single_task_after_reset(env: Any) -> Any:
-    env.reset()
-    return get_single_task(env)
 
 
 def run_episodes(
@@ -823,52 +760,8 @@ def print_context(args: argparse.Namespace) -> None:
         print(f"{name}={os.environ.get(name, '<unset>')}")
 
 
-def validate_residual_control_args(args: argparse.Namespace) -> None:
-    if bool(args.residual_dry_run) and bool(args.enable_learned_residual_control):
-        raise ValueError(
-            "--residual-dry-run and --enable-learned-residual-control cannot be enabled together."
-        )
-    if pregrasp_intervention_enabled(args) and getattr(args, "gripper_close_direction", None) is None:
-        raise ValueError("--gripper-close-direction is required for pregrasp intervention.")
-    if (
-        getattr(args, "left_gripper_closed_value", None) is not None
-        and getattr(args, "gripper_close_threshold", None) is None
-    ):
-        args.gripper_close_threshold = float(args.left_gripper_closed_value)
-
-
 def resolve_residual_control_flags(args: argparse.Namespace) -> dict[str, bool]:
-    validate_residual_control_args(args)
-    if bool(args.residual_dry_run):
-        return {"dry_run": True, "learned_residual_control_enabled": False}
-    if bool(args.enable_learned_residual_control):
-        return {"dry_run": False, "learned_residual_control_enabled": True}
-    return {"dry_run": False, "learned_residual_control_enabled": False}
-
-
-def resolve_residual_dry_run(args: argparse.Namespace) -> bool:
-    return bool(resolve_residual_control_flags(args)["dry_run"])
-
-
-def learned_residual_control_enabled(args: argparse.Namespace) -> bool:
-    return bool(resolve_residual_control_flags(args)["learned_residual_control_enabled"])
-
-
-def handover_intervention_enabled(args: argparse.Namespace) -> bool:
-    return handover_intervention_enabled_for_mode(
-        getattr(args, "execution_mode", "gate_controlled_hybrid")
-    )
-
-
-def pregrasp_intervention_enabled(args: argparse.Namespace) -> bool:
-    return pregrasp_intervention_enabled_for_mode(
-        getattr(args, "execution_mode", "gate_controlled_hybrid"),
-        enable_pregrasp_intervention=getattr(args, "enable_pregrasp_intervention", False),
-    )
-
-
-def ee_intervention_enabled(args: argparse.Namespace) -> bool:
-    return handover_intervention_enabled(args) or pregrasp_intervention_enabled(args)
+    return _resolve_residual_control_flags(args)
 
 
 def build_pregrasp_trigger_config(args: argparse.Namespace) -> PregraspTriggerConfig:
