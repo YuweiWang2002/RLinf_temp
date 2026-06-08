@@ -27,7 +27,6 @@ from rlinf.algorithms.residual_td3.gate_head import ChunkAwareGateRuntime
 from rlinf.algorithms.residual_td3.pregrasp_trigger import (
     PregraspTriggerConfig,
     PregraspTriggerResult,
-    choose_intervention_stage,
     detect_pregrasp_trigger,
 )
 from rlinf.algorithms.residual_td3.residual_actor_runtime import (
@@ -40,6 +39,12 @@ from rlinf.algorithms.residual_td3.residual_ee_intervention import (
     ResidualEEInterventionRunner,
 )
 from rlinf.algorithms.residual_td3.rollout_engine import ResidualRolloutEngine
+from rlinf.algorithms.residual_td3.stage_decision import (
+    InterventionStage,
+    decide_execution_plan,
+    handover_intervention_enabled_for_mode,
+    pregrasp_intervention_enabled_for_mode,
+)
 from rlinf.algorithms.residual_td3.task_config import (
     load_residual_task_config,
     task_config_to_rollout_defaults,
@@ -404,38 +409,48 @@ def run_episode(
         qpos_exec_chunk = qpos_full[:, : args.chunk_len, :].contiguous()
         z_t = info["action_head_hidden"]
         gate_logit, gate_prob = compute_gate(gate_runtime, z_t, gate_action_chunk)
-        handover_gate_binary = bool(handover_intervention_enabled(args) and gate_prob >= args.gate_threshold)
         pregrasp_result = detect_pregrasp_trigger(
             qpos_exec_chunk.detach().cpu().numpy(),
             env_step=env_steps,
             config=pregrasp_config,
             last_trigger_step=last_pregrasp_trigger_step,
         )
-        intervention_stage = choose_intervention_stage(
-            handover_gate=handover_gate_binary,
-            pregrasp_trigger=pregrasp_result.triggered,
-            enable_handover=handover_intervention_enabled(args),
-            enable_pregrasp=pregrasp_intervention_enabled(args),
+        execution_plan = decide_execution_plan(
+            execution_mode=args.execution_mode,
+            gate_prob=gate_prob,
+            gate_threshold=args.gate_threshold,
+            pregrasp_triggered=pregrasp_result.triggered,
+            enable_pregrasp_intervention=getattr(args, "enable_pregrasp_intervention", False),
+            residual_horizon_k=args.residual_horizon_k,
+            target_horizon_offset=args.residual_target_horizon_offset,
+            action_chunk_len=qpos_exec_chunk.shape[1],
         )
-        gate_binary = intervention_stage == "handover"
-        ee16_binary = intervention_stage != "none"
-        execution_mode = "ee16_zero_residual" if ee16_binary else "qpos14"
+        intervention_stage = execution_plan.intervention_stage_name
+        gate_binary = execution_plan.gate_binary
+        handover_gate_binary = bool(
+            handover_intervention_enabled(args) and gate_prob >= args.gate_threshold
+        )
+        ee16_binary = execution_plan.ee16_binary
+        execution_mode = execution_plan.execution_mode
         env_step_start = env_steps
 
-        env.robotwin_action_mode = "ee16" if ee16_binary else "qpos14"
+        env.robotwin_action_mode = execution_plan.env_action_mode
         env.ee16_execution_strategy = args.ee16_execution_strategy
         fk_time_s = 0.0
         residual_norm = 0.0
         right_xyz_movement_norm = 0.0
         intervention_meta: dict[str, object] = {}
         if ee16_binary:
-            active_runner = intervention_runner if intervention_stage == "handover" else pregrasp_runner
+            active_runner = (
+                intervention_runner
+                if execution_plan.stage == InterventionStage.HANDOVER
+                else pregrasp_runner
+            )
             if active_runner is None:
                 raise RuntimeError("EE intervention mode requires a residual intervention runner.")
-            if intervention_stage == "pregrasp":
+            if execution_plan.stage == InterventionStage.PREGRASP:
                 last_pregrasp_trigger_step = env_step_start
             fk_start = time.perf_counter()
-            trigger_source = "handover_gate" if intervention_stage == "handover" else "gripper_chunk"
             intervention = active_runner.run(
                 qpos_exec_chunk.to(args.device),
                 gate_score=gate_prob,
@@ -444,9 +459,9 @@ def run_episode(
                 env_step=env_step_start,
                 intervention_id=replan_id,
                 intervention_stage=intervention_stage,
-                trigger_source=trigger_source,
+                trigger_source=execution_plan.runtime_trigger_source,
                 trigger_metadata=pregrasp_metadata(pregrasp_result)
-                if intervention_stage == "pregrasp"
+                if execution_plan.stage == InterventionStage.PREGRASP
                 else {},
             )
             fk_time_s = time.perf_counter() - fk_start
@@ -840,20 +855,16 @@ def learned_residual_control_enabled(args: argparse.Namespace) -> bool:
 
 
 def handover_intervention_enabled(args: argparse.Namespace) -> bool:
-    return getattr(args, "execution_mode", "gate_controlled_hybrid") in {
-        "gate_controlled_hybrid",
-        "handover_only_k50",
-        "pregrasp_plus_handover_k50",
-    }
+    return handover_intervention_enabled_for_mode(
+        getattr(args, "execution_mode", "gate_controlled_hybrid")
+    )
 
 
 def pregrasp_intervention_enabled(args: argparse.Namespace) -> bool:
-    return bool(getattr(args, "enable_pregrasp_intervention", False)) or getattr(
-        args, "execution_mode", "gate_controlled_hybrid"
-    ) in {
-        "pregrasp_only_k50",
-        "pregrasp_plus_handover_k50",
-    }
+    return pregrasp_intervention_enabled_for_mode(
+        getattr(args, "execution_mode", "gate_controlled_hybrid"),
+        enable_pregrasp_intervention=getattr(args, "enable_pregrasp_intervention", False),
+    )
 
 
 def ee_intervention_enabled(args: argparse.Namespace) -> bool:
