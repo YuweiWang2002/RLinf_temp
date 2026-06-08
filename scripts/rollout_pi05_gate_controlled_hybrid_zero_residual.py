@@ -3,13 +3,11 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import os
 import sys
 import time
 import traceback
-from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -17,7 +15,14 @@ from typing import Any
 import numpy as np
 import torch
 
-from rlinf.algorithms.residual_td3.fk_bridge import AlohaFKBridge
+from rlinf.algorithms.residual_td3.episode_logger import (
+    print_summary,
+    residual_prediction_stats,
+    save_hybrid_log,
+    save_hybrid_plot,
+    save_intervention_records,
+    write_json,
+)
 from rlinf.algorithms.residual_td3.gate_head import ChunkAwareGateRuntime
 from rlinf.algorithms.residual_td3.pregrasp_trigger import (
     PregraspTriggerConfig,
@@ -25,16 +30,16 @@ from rlinf.algorithms.residual_td3.pregrasp_trigger import (
     choose_intervention_stage,
     detect_pregrasp_trigger,
 )
-from rlinf.algorithms.residual_td3.residual_ee_intervention import (
-    BCResidualActor,
-    ConstantResidualActor,
-    RandomNoiseResidualActor,
-    ResidualEEInterventionConfig,
-    ResidualEEInterventionRunner,
-    TD3ResidualActor,
-    ZeroInitResidualActor,
-    ZeroResidualActor,
+from rlinf.algorithms.residual_td3.residual_actor_runtime import (
+    build_intervention_runner_from_args,
 )
+from rlinf.algorithms.residual_td3.residual_actor_runtime import (
+    build_pregrasp_intervention_runner as build_pregrasp_runner_from_handover,
+)
+from rlinf.algorithms.residual_td3.residual_ee_intervention import (
+    ResidualEEInterventionRunner,
+)
+from rlinf.algorithms.residual_td3.rollout_engine import ResidualRolloutEngine
 from rlinf.algorithms.residual_td3.task_config import (
     load_residual_task_config,
     task_config_to_rollout_defaults,
@@ -327,59 +332,17 @@ def load_gate_runtime(args: argparse.Namespace) -> ChunkAwareGateRuntime | None:
 
 
 def build_intervention_runner(task: Any, args: argparse.Namespace) -> ResidualEEInterventionRunner:
-    if args.residual_actor == "zero":
-        actor = ZeroResidualActor()
-    elif args.residual_actor == "zero_init":
-        actor = ZeroInitResidualActor(
-            chunk_len=args.residual_horizon_k,
-            delta_max=args.residual_max_delta_local_xyz,
-            device=args.device,
-        )
-    elif args.residual_actor == "bc":
-        if not args.residual_actor_checkpoint:
-            raise ValueError("--residual-actor-checkpoint is required for --residual-actor bc.")
-        actor = BCResidualActor.load_from_checkpoint(args.residual_actor_checkpoint, device=args.device)
-    elif args.residual_actor == "td3":
-        if not args.residual_actor_checkpoint:
-            raise ValueError("--residual-actor-checkpoint is required for --residual-actor td3.")
-        actor = TD3ResidualActor.load_from_checkpoint(args.residual_actor_checkpoint, device=args.device)
-    elif args.residual_actor == "random_noise":
-        actor = RandomNoiseResidualActor(
-            noise_std=args.residual_noise_std,
-            max_delta_local_xyz=args.residual_max_delta_local_xyz,
-            seed=args.seed,
-        )
-    else:
-        actor = ConstantResidualActor(tuple(float(v) for v in args.residual_constant_delta_local_xyz))
-    control_flags = resolve_residual_control_flags(args)
-    cfg = ResidualEEInterventionConfig(
-        horizon_k=args.residual_horizon_k,
-        target_horizon_offset=args.residual_target_horizon_offset,
-        max_delta_local_xyz=args.residual_max_delta_local_xyz,
-        left_stabilization_mode=args.left_stabilization_mode,
-        left_deadband_xyz=args.left_deadband_xyz,
-        left_lowpass_alpha=args.left_lowpass_alpha,
-        residual_scale=args.residual_scale,
-        dry_run=control_flags["dry_run"],
-        learned_residual_control_enabled=control_flags["learned_residual_control_enabled"],
-    )
-    return ResidualEEInterventionRunner(
-        AlohaFKBridge.from_robotwin_task(task, device=args.device),
-        actor,
-        cfg,
+    return build_intervention_runner_from_args(
+        task,
+        args,
+        resolve_residual_control_flags(args),
     )
 
 
 def build_pregrasp_intervention_runner(
     handover_runner: ResidualEEInterventionRunner,
 ) -> ResidualEEInterventionRunner:
-    cfg = replace(
-        handover_runner.config,
-        dry_run=False,
-        learned_residual_control_enabled=False,
-        residual_scale=1.0,
-    )
-    return ResidualEEInterventionRunner(handover_runner.bridge, ZeroResidualActor(), cfg)
+    return build_pregrasp_runner_from_handover(handover_runner)
 
 
 def get_single_task_after_reset(env: Any) -> Any:
@@ -395,46 +358,14 @@ def run_episodes(
     args: argparse.Namespace,
     episode_seeds: list[int],
 ) -> dict[str, Any]:
-    save_dir = Path(args.save_dir)
-    summaries = []
-    for episode_id, seed in enumerate(episode_seeds):
-        summary = run_episode(env, model, gate_runtime, intervention_runner, args, episode_id, seed)
-        summaries.append(summary)
-        write_json(save_dir / "summary.json", {"episodes": summaries})
-    successes = [row["success"] for row in summaries]
-    returns = [row["return"] for row in summaries]
-    return {
-        "execution_mode": args.execution_mode,
-        "ee16_execution_strategy": args.ee16_execution_strategy,
-        "gate_type": args.gate_type,
-        "gate_threshold": args.gate_threshold,
-        "gate_chunk_len": args.gate_chunk_len,
-        "chunk_aware_gate_checkpoint": args.chunk_aware_gate_checkpoint,
-        "enable_residual_intervention": bool(args.enable_residual_intervention),
-        "enable_pregrasp_intervention": pregrasp_intervention_enabled(args),
-        "gripper_close_direction": args.gripper_close_direction,
-        "gripper_close_threshold": args.gripper_close_threshold,
-        "gripper_closing_delta_threshold": args.gripper_closing_delta_threshold,
-        "pregrasp_cooldown_steps": args.pregrasp_cooldown_steps,
-        "residual_actor": args.residual_actor,
-        "residual_actor_checkpoint": args.residual_actor_checkpoint,
-        "residual_dry_run": resolve_residual_dry_run(args),
-        "residual_scale": args.residual_scale,
-        "enable_learned_residual_control": learned_residual_control_enabled(args),
-        "residual_horizon_k": args.residual_horizon_k,
-        "residual_target_horizon_offset": args.residual_target_horizon_offset,
-        "residual_max_delta_local_xyz": args.residual_max_delta_local_xyz,
-        "chunk_len": args.chunk_len,
-        "model_num_action_chunks": args.model_num_action_chunks,
-        "max_steps": args.max_steps,
-        "requested_num_episodes": args.num_episodes,
-        "rollout_status": "completed",
-        "simulator_crash": False,
-        "success_rate": float(np.mean(successes)) if successes else 0.0,
-        "mean_return": float(np.mean(returns)) if returns else 0.0,
-        "episodes": summaries,
-        "save_dir": str(save_dir),
-    }
+    return ResidualRolloutEngine(
+        env=env,
+        model=model,
+        gate_runtime=gate_runtime,
+        intervention_runner=intervention_runner,
+        args=args,
+        run_episode_fn=run_episode,
+    ).run(episode_seeds)
 
 
 def run_episode(
@@ -856,50 +787,6 @@ def pregrasp_metadata(result: PregraspTriggerResult) -> dict[str, object]:
     }
 
 
-def residual_prediction_stats(records: list[dict[str, object]]) -> dict[str, float | int]:
-    pred_norm = np.asarray([row.get("pred_delta_norm", 0.0) for row in records], dtype=np.float64)
-    applied_norm = np.asarray([row.get("applied_delta_norm", 0.0) for row in records], dtype=np.float64)
-    saturation = np.asarray([row.get("saturation", 0) for row in records], dtype=np.float64)
-    nan_inf = np.asarray([row.get("has_nan_or_inf", 0) for row in records], dtype=np.int64)
-    if pred_norm.size == 0:
-        return {
-            "pred_norm_mean": 0.0,
-            "pred_norm_std": 0.0,
-            "pred_norm_max": 0.0,
-            "pred_norm_p50": 0.0,
-            "pred_norm_p90": 0.0,
-            "pred_norm_p95": 0.0,
-            "pred_norm_p99": 0.0,
-            "applied_norm_mean": 0.0,
-            "applied_norm_std": 0.0,
-            "applied_norm_max": 0.0,
-            "applied_norm_p50": 0.0,
-            "applied_norm_p90": 0.0,
-            "applied_norm_p95": 0.0,
-            "applied_norm_p99": 0.0,
-            "saturation_ratio": 0.0,
-            "nan_inf_count": 0,
-        }
-    return {
-        "pred_norm_mean": float(pred_norm.mean()),
-        "pred_norm_std": float(pred_norm.std()),
-        "pred_norm_max": float(pred_norm.max()),
-        "pred_norm_p50": float(np.percentile(pred_norm, 50)),
-        "pred_norm_p90": float(np.percentile(pred_norm, 90)),
-        "pred_norm_p95": float(np.percentile(pred_norm, 95)),
-        "pred_norm_p99": float(np.percentile(pred_norm, 99)),
-        "applied_norm_mean": float(applied_norm.mean()) if applied_norm.size else 0.0,
-        "applied_norm_std": float(applied_norm.std()) if applied_norm.size else 0.0,
-        "applied_norm_max": float(applied_norm.max()) if applied_norm.size else 0.0,
-        "applied_norm_p50": float(np.percentile(applied_norm, 50)) if applied_norm.size else 0.0,
-        "applied_norm_p90": float(np.percentile(applied_norm, 90)) if applied_norm.size else 0.0,
-        "applied_norm_p95": float(np.percentile(applied_norm, 95)) if applied_norm.size else 0.0,
-        "applied_norm_p99": float(np.percentile(applied_norm, 99)) if applied_norm.size else 0.0,
-        "saturation_ratio": float(saturation.mean()) if saturation.size else 0.0,
-        "nan_inf_count": int(nan_inf.sum()) if nan_inf.size else 0,
-    }
-
-
 def failure_reason(success: bool, done: bool, episode_length: int, max_steps: int) -> str | None:
     if success:
         return None
@@ -908,77 +795,6 @@ def failure_reason(success: bool, done: bool, episode_length: int, max_steps: in
     if done:
         return "terminated_without_success"
     return "stopped_without_success"
-
-
-def save_hybrid_log(save_dir: Path, episode_id: int, rows: list[dict[str, Any]]) -> Path:
-    path = save_dir / f"hybrid_log_episode_{episode_id:04d}.parquet"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    pq.write_table(pa.Table.from_pylist(rows) if rows else pa.table({}), path)
-    csv_path = path.with_suffix(".csv")
-    if rows:
-        with csv_path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
-            writer.writeheader()
-            writer.writerows(rows)
-    return path
-
-
-def save_intervention_records(save_dir: Path, episode_id: int, records: list[dict[str, object]]) -> Path:
-    path = save_dir / f"intervention_records_episode_{episode_id:04d}.parquet"
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    pq.write_table(pa.Table.from_pylist(records) if records else pa.table({}), path)
-    return path
-
-
-def save_hybrid_plot(save_dir: Path, episode_id: int, rows: list[dict[str, Any]], threshold: float) -> Path | None:
-    if not rows:
-        return None
-    import matplotlib.pyplot as plt
-
-    plot_dir = save_dir / "plots"
-    plot_dir.mkdir(parents=True, exist_ok=True)
-    path = plot_dir / f"hybrid_plot_episode_{episode_id:04d}.png"
-    x = np.asarray([row["env_step"] for row in rows], dtype=np.int64)
-    gate_prob = np.asarray([row["gate_prob"] for row in rows], dtype=np.float32)
-    gate = np.asarray([row["gate_binary"] for row in rows], dtype=np.float32)
-    mode = np.asarray([1.0 if row["execution_mode"] == "ee16_zero_residual" else 0.0 for row in rows])
-    left_gripper = np.asarray([row["obs_state_06"] for row in rows], dtype=np.float32)
-    right_gripper = np.asarray([row["obs_state_13"] for row in rows], dtype=np.float32)
-    dist = np.asarray([np.nan if row["d_LR"] is None else row["d_LR"] for row in rows], dtype=np.float32)
-    success = np.asarray([row["success"] for row in rows], dtype=np.float32)
-    done = np.asarray([row["done"] for row in rows], dtype=np.float32)
-
-    fig, axes = plt.subplots(4, 1, figsize=(10, 8), sharex=True)
-    axes[0].plot(x, gate_prob, label="gate_prob")
-    axes[0].axhline(threshold, color="tab:red", linestyle="--", label=f"threshold={threshold:g}")
-    axes[0].set_ylim(0.0, 1.05)
-    axes[0].legend(loc="upper right")
-    axes[1].step(x, gate, where="post", label="gate_binary")
-    axes[1].step(x, mode, where="post", label="ee16_zero_residual")
-    axes[1].legend(loc="upper right")
-    axes[2].plot(x, left_gripper, label="left_gripper")
-    axes[2].plot(x, right_gripper, label="right_gripper")
-    axes[2].legend(loc="upper right")
-    axes[3].plot(x, dist, label="d_LR")
-    axes[3].scatter(x[done > 0], done[done > 0], marker="x", label="done")
-    axes[3].scatter(x[success > 0], success[success > 0], marker="o", label="success")
-    axes[3].legend(loc="upper right")
-    axes[3].set_xlabel("env_step")
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    return path
-
-
-def write_json(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2)
 
 
 def print_context(args: argparse.Namespace) -> None:
@@ -990,13 +806,6 @@ def print_context(args: argparse.Namespace) -> None:
     print(f"resolved_learned_residual_control_enabled={learned_residual_control_enabled(args)}")
     for name in ("REPO_PATH", "ROBOTWIN_PATH", "ROBOTWIN_ASSETS_PATH", "ROBOT_PLATFORM", "CUDA_VISIBLE_DEVICES"):
         print(f"{name}={os.environ.get(name, '<unset>')}")
-
-
-def print_summary(metrics: dict[str, Any]) -> None:
-    print("HYBRID SUMMARY")
-    print("--------------")
-    for key in ("execution_mode", "ee16_execution_strategy", "success_rate", "mean_return", "save_dir"):
-        print(f"{key}={metrics[key]}")
 
 
 def validate_residual_control_args(args: argparse.Namespace) -> None:
