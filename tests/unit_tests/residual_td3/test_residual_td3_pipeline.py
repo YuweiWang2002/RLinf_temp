@@ -76,6 +76,7 @@ def test_pipeline_dry_run_writes_metadata(tmp_path, monkeypatch):
     assert metadata["subcommand"] == "rollout-eval"
     assert metadata["dry_run"]
     assert metadata["mock_runtime"] is False
+    assert metadata["program_success"] is None
 
 
 def test_pipeline_missing_task_config_has_clear_error(capsys):
@@ -243,3 +244,166 @@ def test_mock_train_td3_cpu_runs_from_mock_replay(tmp_path, monkeypatch):
     assert (out_dir / "critic_td3.pt").exists()
     assert (out_dir / "metrics.csv").exists()
     assert (out_dir / "summary.json").exists()
+
+
+def test_task_failure_with_complete_rollout_artifacts_exits_zero(tmp_path):
+    out_dir = tmp_path / "rollout"
+    out_dir.mkdir()
+    hybrid = out_dir / "hybrid_log_episode_0000.parquet"
+    records = out_dir / "intervention_records_episode_0000.parquet"
+    hybrid.write_text("", encoding="utf-8")
+    records.write_text("", encoding="utf-8")
+    (out_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "success_rate": 0.0,
+                "episodes": [
+                    {
+                        "hybrid_log_path": str(hybrid),
+                        "intervention_records_path": str(records),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    args, _ = pipeline.parse_args(
+        [
+            "rollout-eval",
+            "--task-config",
+            TASK_CONFIG,
+            "--run-name",
+            "task_fail",
+        ]
+    )
+
+    result = pipeline.evaluate_run_result(args, out_dir, raw_exit_code=1)
+
+    assert result["program_success"] is True
+    assert result["task_success"] is False
+    assert result["artifact_complete"] is True
+    assert result["failure_type"] == "task_failure"
+    assert result["exit_code"] == 0
+
+
+def test_fail_on_task_failure_exits_one(tmp_path):
+    out_dir = tmp_path / "rollout"
+    out_dir.mkdir()
+    hybrid = out_dir / "hybrid_log_episode_0000.parquet"
+    records = out_dir / "intervention_records_episode_0000.parquet"
+    hybrid.write_text("", encoding="utf-8")
+    records.write_text("", encoding="utf-8")
+    (out_dir / "summary.json").write_text(
+        json.dumps(
+            {
+                "success_rate": 0.0,
+                "episodes": [
+                    {
+                        "hybrid_log_path": str(hybrid),
+                        "intervention_records_path": str(records),
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    args, _ = pipeline.parse_args(
+        [
+            "rollout-eval",
+            "--task-config",
+            TASK_CONFIG,
+            "--run-name",
+            "task_fail",
+            "--fail-on-task-failure",
+        ]
+    )
+
+    result = pipeline.evaluate_run_result(args, out_dir, raw_exit_code=0)
+
+    assert result["failure_type"] == "task_failure"
+    assert result["exit_code"] == 1
+
+
+def test_artifact_missing_exits_one(tmp_path):
+    args, _ = pipeline.parse_args(
+        [
+            "collect-replay",
+            "--task-config",
+            TASK_CONFIG,
+            "--run-name",
+            "missing_artifact",
+        ]
+    )
+
+    result = pipeline.evaluate_run_result(args, tmp_path, raw_exit_code=0)
+
+    assert result["program_success"] is False
+    assert result["artifact_complete"] is False
+    assert result["failure_type"] == "artifact_missing"
+    assert result["exit_code"] == 1
+
+
+def test_program_exception_exits_nonzero(tmp_path):
+    args, _ = pipeline.parse_args(
+        [
+            "rollout-eval",
+            "--task-config",
+            TASK_CONFIG,
+            "--run-name",
+            "program_error",
+        ]
+    )
+
+    result = pipeline.evaluate_run_result(args, tmp_path, raw_exit_code=2)
+
+    assert result["program_success"] is False
+    assert result["failure_type"] == "program_error"
+    assert result["exit_code"] == 2
+
+
+def test_collect_replay_complete_artifacts_exit_zero(tmp_path):
+    for name in ("replay.npz", "episodes_summary.csv", "config.json"):
+        (tmp_path / name).write_text("", encoding="utf-8")
+    (tmp_path / "reward_summary.json").write_text(
+        json.dumps({"success_rate": 0.0}),
+        encoding="utf-8",
+    )
+    args, _ = pipeline.parse_args(
+        [
+            "collect-replay",
+            "--task-config",
+            TASK_CONFIG,
+            "--run-name",
+            "collect_complete",
+        ]
+    )
+
+    result = pipeline.evaluate_run_result(args, tmp_path, raw_exit_code=1)
+
+    assert result["program_success"] is True
+    assert result["task_success"] is False
+    assert result["artifact_complete"] is True
+    assert result["exit_code"] == 0
+
+
+def test_update_run_metadata_records_program_and_task_status(tmp_path):
+    metadata_path = tmp_path / "run_metadata.json"
+    metadata_path.write_text(json.dumps({"run_name": "x"}), encoding="utf-8")
+
+    pipeline.update_run_metadata(
+        tmp_path,
+        {
+            "program_success": True,
+            "task_success": False,
+            "artifact_complete": True,
+            "exit_code": 0,
+            "failure_type": "task_failure",
+        },
+    )
+
+    metadata = json.loads(metadata_path.read_text())
+    assert metadata["program_success"] is True
+    assert metadata["task_success"] is False
+    assert metadata["artifact_complete"] is True
+    assert metadata["exit_code"] == 0
+    assert metadata["failure_type"] == "task_failure"

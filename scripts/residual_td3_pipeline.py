@@ -39,6 +39,11 @@ def add_common_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--task-config", required=True)
     parser.add_argument("--run-name", required=True)
     parser.add_argument(
+        "--fail-on-task-failure",
+        action="store_true",
+        help="Return non-zero when the task itself fails even if program artifacts are complete.",
+    )
+    parser.add_argument(
         "--mock-runtime",
         action="store_true",
         help="Write no-GPU mock artifacts instead of launching real env/model scripts.",
@@ -93,10 +98,14 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.mock_runtime and args.subcommand in {"rollout-eval", "collect-replay"}:
         summary = run_mock_subcommand(args, task_cfg, output_dir)
+        result = evaluate_run_result(args, output_dir, raw_exit_code=0)
+        update_run_metadata(output_dir, result)
         print(json.dumps({"output_dir": str(output_dir), "mock_runtime": True, "summary": summary}, indent=2))
-        return 0
+        return int(result["exit_code"])
     completed = subprocess.run(command, cwd=REPO_ROOT, env=subprocess_env())
-    return int(completed.returncode)
+    result = evaluate_run_result(args, output_dir, raw_exit_code=int(completed.returncode))
+    update_run_metadata(output_dir, result)
+    return int(result["exit_code"])
 
 
 def output_dir_for(task_name: str, subcommand: str, run_name: str) -> Path:
@@ -247,6 +256,83 @@ def mock_runtime_module() -> Any:
     return importlib.import_module("rlinf.algorithms.residual_td3.mock_runtime")
 
 
+def evaluate_run_result(
+    args: argparse.Namespace,
+    output_dir: Path,
+    *,
+    raw_exit_code: int,
+) -> dict[str, Any]:
+    artifact_complete = artifacts_complete(args.subcommand, output_dir)
+    task_success = read_task_success(args.subcommand, output_dir)
+    if artifact_complete:
+        program_success = True
+        failure_type = "task_failure" if not task_success else "none"
+    else:
+        program_success = False
+        failure_type = "program_error" if raw_exit_code != 0 else "artifact_missing"
+    if not program_success:
+        exit_code = raw_exit_code if raw_exit_code != 0 else 1
+    elif bool(args.fail_on_task_failure) and not task_success:
+        exit_code = 1
+    else:
+        exit_code = 0
+    return {
+        "program_success": bool(program_success),
+        "task_success": bool(task_success),
+        "artifact_complete": bool(artifact_complete),
+        "raw_exit_code": int(raw_exit_code),
+        "exit_code": int(exit_code),
+        "failure_type": failure_type,
+    }
+
+
+def artifacts_complete(subcommand: str, output_dir: Path) -> bool:
+    if subcommand == "rollout-eval":
+        summary = load_json_if_exists(output_dir / "summary.json")
+        if summary is None:
+            return False
+        episodes = summary.get("episodes", [])
+        return all(paths_exist(ep.get("hybrid_log_path"), ep.get("intervention_records_path")) for ep in episodes)
+    if subcommand == "collect-replay":
+        required = ("replay.npz", "episodes_summary.csv", "reward_summary.json", "config.json")
+        return all((output_dir / name).exists() for name in required)
+    if subcommand == "train-td3":
+        required = ("actor_td3.pt", "critic_td3.pt", "metrics.csv", "summary.json")
+        return all((output_dir / name).exists() for name in required)
+    return False
+
+
+def read_task_success(subcommand: str, output_dir: Path) -> bool:
+    if subcommand == "rollout-eval":
+        summary = load_json_if_exists(output_dir / "summary.json")
+        return bool(summary and float(summary.get("success_rate", 0.0)) > 0.0)
+    if subcommand == "collect-replay":
+        summary = load_json_if_exists(output_dir / "reward_summary.json")
+        return bool(summary and float(summary.get("success_rate", 0.0)) > 0.0)
+    if subcommand == "train-td3":
+        summary = load_json_if_exists(output_dir / "summary.json")
+        return bool(summary and summary.get("actor_smoke", {}).get("finite", False))
+    return False
+
+
+def paths_exist(*paths: object) -> bool:
+    return all(isinstance(path, str) and bool(path) and Path(path).exists() for path in paths)
+
+
+def load_json_if_exists(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def update_run_metadata(output_dir: Path, result: dict[str, Any]) -> None:
+    metadata_path = output_dir / "run_metadata.json"
+    metadata = load_json_if_exists(metadata_path) or {}
+    metadata.update(result)
+    write_json(metadata_path, metadata)
+
+
 def write_run_metadata(
     output_dir: Path,
     args: argparse.Namespace,
@@ -273,6 +359,11 @@ def write_run_metadata(
             "mock_runtime": bool(args.mock_runtime),
             "real_env": not bool(args.mock_runtime),
             "real_model": not bool(args.mock_runtime),
+            "program_success": None,
+            "task_success": None,
+            "artifact_complete": None,
+            "exit_code": None,
+            "failure_type": None,
         },
     )
 
