@@ -128,3 +128,20 @@ def test_cooldown_blocked_pregrasp_result_keeps_qpos_plan():
     )
 
     assert plan.stage == InterventionStage.QPOS
+
+
+def test_handover_max_interventions_cap_keeps_qpos_plan():
+    plan = decide_execution_plan(
+        execution_mode="handover_only_k50",
+        gate_prob=1.0,
+        gate_threshold=0.5,
+        pregrasp_triggered=False,
+        residual_horizon_k=50,
+        action_chunk_len=60,
+        handover_interventions_so_far=1,
+        max_handover_interventions_per_episode=1,
+    )
+
+    assert plan.stage == InterventionStage.QPOS
+    assert plan.trigger_source == TriggerSource.NONE
+    assert plan.execution_mode == "qpos14"

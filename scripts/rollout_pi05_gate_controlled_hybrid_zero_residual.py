@@ -153,6 +153,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument("--residual-horizon-k", "--residual_horizon_k", dest="residual_horizon_k", type=int, default=50)
     parser.add_argument(
+        "--max-handover-interventions-per-episode",
+        type=int,
+        default=None,
+        help="Optional cap on handover EE intervention replans per episode; default keeps existing unlimited behavior.",
+    )
+    parser.add_argument(
         "--residual-target-horizon-offset",
         "--residual_target_horizon_offset",
         dest="residual_target_horizon_offset",
@@ -361,6 +367,8 @@ def run_episode(
             residual_horizon_k=args.residual_horizon_k,
             target_horizon_offset=args.residual_target_horizon_offset,
             action_chunk_len=qpos_exec_chunk.shape[1],
+            handover_interventions_so_far=count_stage_interventions(rows, "handover"),
+            max_handover_interventions_per_episode=args.max_handover_interventions_per_episode,
         )
         intervention_stage = execution_plan.intervention_stage_name
         gate_binary = execution_plan.gate_binary

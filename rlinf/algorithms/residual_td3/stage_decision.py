@@ -108,10 +108,17 @@ def decide_execution_plan(
     residual_horizon_k: int = 50,
     target_horizon_offset: int = 0,
     action_chunk_len: int | None = None,
+    handover_interventions_so_far: int = 0,
+    max_handover_interventions_per_episode: int | None = None,
 ) -> ExecutionPlan:
     """Build a pure execution plan from trigger signals and rollout flags."""
 
     enable_handover = handover_intervention_enabled_for_mode(execution_mode)
+    if (
+        max_handover_interventions_per_episode is not None
+        and handover_interventions_so_far >= max_handover_interventions_per_episode
+    ):
+        enable_handover = False
     enable_pregrasp = pregrasp_intervention_enabled_for_mode(
         execution_mode,
         enable_pregrasp_intervention=enable_pregrasp_intervention,
