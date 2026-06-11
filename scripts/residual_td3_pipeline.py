@@ -61,6 +61,12 @@ def add_rollout_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-steps", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--device", default=None)
+    parser.add_argument("--save-video", action="store_true")
+    parser.add_argument("--video-base-dir", default=None)
+    parser.add_argument("--num-save-videos", type=int, default=None)
+    parser.add_argument("--video-temp-subsample", type=int, default=None)
+    parser.add_argument("--video-fps", type=int, default=None)
+    parser.add_argument("--save-actual-state-trace", action="store_true")
 
 
 def add_collect_args(parser: argparse.ArgumentParser) -> None:
@@ -145,6 +151,14 @@ def build_wrapped_command(
         append_optional(command, "--max-steps", args.max_steps)
         append_optional(command, "--seed", args.seed)
         append_optional(command, "--device", args.device)
+        if args.save_video:
+            command.append("--save-video")
+        append_optional(command, "--video-base-dir", args.video_base_dir)
+        append_optional(command, "--num-save-videos", args.num_save_videos)
+        append_optional(command, "--video-temp-subsample", args.video_temp_subsample)
+        append_optional(command, "--video-fps", args.video_fps)
+        if args.save_actual_state_trace:
+            command.append("--save-actual-state-trace")
         return command + passthrough
 
     if args.subcommand == "collect-replay":

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -54,17 +55,19 @@ from rlinf.algorithms.residual_td3.task_config import (
     load_residual_task_config,
     task_config_to_rollout_defaults,
 )
+from rlinf.algorithms.residual_td3.video_recorder import (
+    ResidualVideoRecorder,
+    frame_from_obs,
+)
 from scripts.rollout_pi05_fk_ee16_zero_residual import (
     DEFAULT_CONFIG as DEFAULT_ENV_CONFIG,
 )
 from scripts.rollout_pi05_fk_ee16_zero_residual import (
-    append_frame,
     bootstrap_robotwin_runtime,
     configure_line_buffering,
     get_single_task,
     read_pose16,
     read_task_qpos14,
-    save_video,
     to_numpy,
 )
 from scripts.rollout_pi05_with_gate_logging import (
@@ -213,6 +216,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--env-split", choices=("train", "eval"), default="eval")
     parser.add_argument("--save-dir", required=pre_args.task_config is None)
     parser.add_argument("--save-video", action="store_true")
+    parser.add_argument("--video-base-dir", default=None)
+    parser.add_argument("--num-save-videos", type=int, default=None)
+    parser.add_argument("--video-temp-subsample", type=int, default=None)
+    parser.add_argument("--save-actual-state-trace", action="store_true")
     parser.add_argument(
         "--video-frame-mode",
         choices=("replan", "executed_step"),
@@ -327,10 +334,13 @@ def run_episode(
 ) -> dict[str, Any]:
     obs, _ = env.reset(env_seeds=[seed])
     task = get_single_task(env)
+    video_recorder = ResidualVideoRecorder.from_args(args)
     frames: list[np.ndarray] = []
-    append_frame(frames, env, obs, args.video_source)
+    frame_to_env_step: list[int] = []
+    video_recorder.append_initial(frames, frame_to_env_step, env, obs)
     rows: list[dict[str, Any]] = []
     intervention_records: list[dict[str, object]] = []
+    actual_state_trace_rows: list[dict[str, Any]] = []
     pregrasp_config = build_pregrasp_trigger_config(args)
     pregrasp_runner = build_pregrasp_intervention_runner(intervention_runner) if intervention_runner else None
     last_pregrasp_trigger_step: int | None = None
@@ -429,7 +439,16 @@ def run_episode(
             env,
             env_action_chunk,
             frames,
+            frame_to_env_step,
             args,
+            video_recorder,
+            env_step_start,
+            task=task,
+            qpos_chunk=qpos_exec_chunk,
+            execution_mode=execution_mode,
+            intervention_stage=intervention_stage,
+            trigger_source=execution_plan.runtime_trigger_source,
+            actual_state_trace_rows=actual_state_trace_rows,
         )
         env_time_s = time.perf_counter() - env_start
         obs = obs_list[-1]
@@ -481,15 +500,22 @@ def run_episode(
     success = bool(getattr(task, "eval_success", False))
     log_path = save_hybrid_log(Path(args.save_dir), episode_id, rows)
     record_path = save_intervention_records(Path(args.save_dir), episode_id, intervention_records)
+    actual_trace_path = save_actual_state_trace(Path(args.save_dir), actual_state_trace_rows)
     plot_path = (
         save_hybrid_plot(Path(args.save_dir), episode_id, rows, args.gate_threshold)
         if args.save_gate_plots
         else None
     )
-    video_path = None
-    if args.save_video:
-        video_path = Path(args.save_dir) / "videos" / f"episode_{episode_id:04d}_seed_{seed}.mp4"
-        save_video(frames, video_path, args.video_fps)
+    video_path = video_recorder.save_episode(
+        frames,
+        frame_to_env_step,
+        episode_id=episode_id,
+        seed=seed,
+        success=success,
+        failure_reason=failure_reason(success, done, env_steps, args.max_steps),
+        num_steps=env_steps,
+        rows=rows,
+    )
     if args.save_debug:
         write_json(
             Path(args.save_dir) / f"episode_{episode_id:04d}_debug.json",
@@ -548,6 +574,7 @@ def run_episode(
         "intervention_stage_timeline": [row["intervention_stage"] for row in rows],
         "hybrid_log_path": str(log_path),
         "intervention_records_path": str(record_path),
+        "actual_state_trace_path": str(actual_trace_path) if actual_trace_path is not None else None,
         "gate_plot_path": str(plot_path) if plot_path is not None else None,
         "video_path": str(video_path) if video_path is not None else None,
     }
@@ -571,19 +598,165 @@ def execute_env_action_chunk(
     env: Any,
     env_action_chunk: np.ndarray,
     frames: list[np.ndarray],
+    frame_to_env_step: list[int],
     args: argparse.Namespace,
+    video_recorder: ResidualVideoRecorder,
+    env_step_start: int,
+    *,
+    task: Any,
+    qpos_chunk: torch.Tensor,
+    execution_mode: str,
+    intervention_stage: str,
+    trigger_source: str,
+    actual_state_trace_rows: list[dict[str, Any]],
 ):
     env_debug: dict[str, Any] = {}
+    if should_step_ee16_with_actual_trace(env, args, execution_mode):
+        obs_list, rewards, terms, truncs, infos_list, env_debug = execute_ee16_chunk_with_actual_trace(
+            env,
+            env_action_chunk,
+            actual_state_trace_rows,
+            task=task,
+            env_step_start=env_step_start,
+            execution_mode=execution_mode,
+            intervention_stage=intervention_stage,
+            trigger_source=trigger_source,
+            args=args,
+        )
+        video_recorder.append_chunk(
+            frames,
+            frame_to_env_step,
+            env,
+            obs_list,
+            env_step_start=env_step_start,
+            video_frame_mode=args.video_frame_mode,
+        )
+        return obs_list, rewards, terms, truncs, infos_list, env_debug
+
     obs_list, rewards, terms, truncs, infos_list = env.chunk_step(env_action_chunk)
     if infos_list and "ee16_chunk_debug" in infos_list[-1]:
         env_debug = dict(infos_list[-1]["ee16_chunk_debug"])
-    if args.save_video:
-        if args.video_frame_mode == "executed_step":
-            for step_obs in obs_list:
-                append_frame(frames, env, step_obs, args.video_source)
-        elif obs_list:
-            append_frame(frames, env, obs_list[-1], args.video_source)
+    append_actual_state_trace_rows(
+        actual_state_trace_rows,
+        task=task,
+        obs_list=obs_list,
+        env_action_chunk=env_action_chunk,
+        qpos_chunk=qpos_chunk,
+        env_step_start=env_step_start,
+        env_step_end=env_step_start + int(rewards.shape[1]),
+        execution_mode=execution_mode,
+        intervention_stage=intervention_stage,
+        trigger_source=trigger_source,
+        env_debug=env_debug,
+        args=args,
+    )
+    video_recorder.append_chunk(
+        frames,
+        frame_to_env_step,
+        env,
+        obs_list,
+        env_step_start=env_step_start,
+        video_frame_mode=args.video_frame_mode,
+    )
     return obs_list, rewards, terms, truncs, infos_list, env_debug
+
+
+def should_step_ee16_with_actual_trace(env: Any, args: argparse.Namespace, execution_mode: str) -> bool:
+    if not getattr(args, "save_actual_state_trace", False):
+        return False
+    if execution_mode != "ee16_zero_residual":
+        return False
+    return hasattr(env, "_step_ee16_action") and hasattr(env, "_select_ee16_execution_indices")
+
+
+def execute_ee16_chunk_with_actual_trace(
+    env: Any,
+    env_action_chunk: np.ndarray,
+    rows: list[dict[str, Any]],
+    *,
+    task: Any,
+    env_step_start: int,
+    execution_mode: str,
+    intervention_stage: str,
+    trigger_source: str,
+    args: argparse.Namespace,
+):
+    if env_action_chunk.ndim != 3:
+        raise ValueError(f"expected EE16 chunk action [B,K,16], got {env_action_chunk.shape}.")
+    chunk_step = int(env_action_chunk.shape[1])
+    selected_indices = list(env._select_ee16_execution_indices(chunk_step))
+    obs_list, infos_list = [], []
+    rewards, terms, truncs = [], [], []
+    env_debug = {
+        "chunk_len": chunk_step,
+        "execution_strategy": getattr(env, "ee16_execution_strategy", None),
+        "selected_target_indices": [int(index) for index in selected_indices],
+        "selected_target_index": int(selected_indices[-1]) if selected_indices else None,
+        "take_action_calls": 0,
+        "take_action_times": [],
+        "hold_noop_count": 0,
+        "left_epsilon_count": 0,
+        "right_epsilon_count": 0,
+        "step_times": [],
+        "planner_failure": False,
+    }
+    for local_i, action_index in enumerate(selected_indices):
+        step_start = time.perf_counter()
+        obs, reward, terminations, truncations, infos = env._step_ee16_action(
+            env_action_chunk[:, action_index],
+            auto_reset=False,
+        )
+        env_debug["step_times"].append(time.perf_counter() - step_start)
+        step_debug = infos.pop("_ee16_step_debug", None)
+        if step_debug is not None:
+            env_debug["take_action_calls"] += int(step_debug.get("take_action_calls", 0))
+            env_debug["take_action_times"].extend(step_debug.get("take_action_times", []))
+            env_debug["hold_noop_count"] += int(step_debug.get("hold_noop_count", 0))
+            env_debug["left_epsilon_count"] += int(step_debug.get("left_epsilon_count", 0))
+            env_debug["right_epsilon_count"] += int(step_debug.get("right_epsilon_count", 0))
+        obs_list.append(obs)
+        infos_list.append(infos)
+        rewards.append(reward)
+        terms.append(terminations)
+        truncs.append(truncations)
+        append_actual_state_trace_row(
+            rows,
+            task=task,
+            obs=obs,
+            commanded_ee16=np.asarray(env_action_chunk[0, action_index], dtype=np.float64),
+            commanded_qpos14=None,
+            env_step=env_step_start + local_i + 1,
+            action_index=int(action_index),
+            execution_mode=execution_mode,
+            intervention_stage=intervention_stage,
+            trigger_source=trigger_source,
+            env_debug=env_debug,
+            args=args,
+        )
+        if torch.logical_or(terminations, truncations).all():
+            break
+    reward_tensor = torch.stack(rewards, dim=1)
+    term_tensor = torch.stack(terms, dim=1)
+    trunc_tensor = torch.stack(truncs, dim=1)
+    if reward_tensor.shape[1] < chunk_step:
+        pad_len = chunk_step - reward_tensor.shape[1]
+        reward_tensor = torch.cat(
+            (
+                reward_tensor,
+                torch.zeros(
+                    env.num_envs,
+                    pad_len,
+                    dtype=reward_tensor.dtype,
+                    device=reward_tensor.device,
+                ),
+            ),
+            dim=1,
+        )
+        term_tensor = torch.cat((term_tensor, term_tensor[:, -1:].expand(env.num_envs, pad_len)), dim=1)
+        trunc_tensor = torch.cat((trunc_tensor, trunc_tensor[:, -1:].expand(env.num_envs, pad_len)), dim=1)
+    if infos_list:
+        infos_list[-1]["ee16_chunk_debug"] = env_debug
+    return obs_list, reward_tensor, term_tensor, trunc_tensor, infos_list, env_debug
 
 
 def build_hybrid_row(**kwargs: Any) -> dict[str, Any]:
@@ -681,6 +854,304 @@ def read_pose_debug(task: Any) -> dict[str, float | None]:
             "right_ee_z": None,
             "d_LR": None,
         }
+
+
+def append_actual_state_trace_rows(
+    rows: list[dict[str, Any]],
+    *,
+    task: Any,
+    obs_list: list[Any],
+    env_action_chunk: np.ndarray,
+    qpos_chunk: torch.Tensor,
+    env_step_start: int,
+    env_step_end: int,
+    execution_mode: str,
+    intervention_stage: str,
+    trigger_source: str,
+    env_debug: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    if not getattr(args, "save_actual_state_trace", False):
+        return
+    step_items = actual_trace_step_items(
+        obs_list,
+        env_action_chunk,
+        qpos_chunk,
+        env_step_start=env_step_start,
+        env_step_end=env_step_end,
+        execution_mode=execution_mode,
+    )
+    for env_step, action_index, step_obs, commanded_ee16, commanded_qpos14 in step_items:
+        append_actual_state_trace_row(
+            rows,
+            task=task,
+            obs=step_obs,
+            commanded_ee16=commanded_ee16,
+            commanded_qpos14=commanded_qpos14,
+            env_step=env_step,
+            action_index=action_index,
+            execution_mode=execution_mode,
+            intervention_stage=intervention_stage,
+            trigger_source=trigger_source,
+            env_debug=env_debug,
+            args=args,
+        )
+
+
+def append_actual_state_trace_row(
+    rows: list[dict[str, Any]],
+    *,
+    task: Any,
+    obs: Any,
+    commanded_ee16: np.ndarray | None,
+    commanded_qpos14: np.ndarray | None,
+    env_step: int,
+    action_index: int | None,
+    execution_mode: str,
+    intervention_stage: str,
+    trigger_source: str,
+    env_debug: dict[str, Any],
+    args: argparse.Namespace,
+) -> None:
+    if not (140 <= int(env_step) <= 210):
+        return
+    row = {
+        "env_step": int(env_step),
+        "action_mode": execution_mode,
+        "execution_stage": intervention_stage,
+        "trigger_source": trigger_source,
+        "action_chunk_index": None if action_index is None else int(action_index),
+        "take_action_calls": int(env_debug.get("take_action_calls", 0)),
+        "left_epsilon_count": int(env_debug.get("left_epsilon_count", 0)),
+        "right_epsilon_count": int(env_debug.get("right_epsilon_count", 0)),
+        "hold_noop_count": int(env_debug.get("hold_noop_count", 0)),
+        "red_pixel_count": red_pixel_count_from_obs(obs, getattr(args, "video_source", "third_view")),
+    }
+    row.update(vector_fields("commanded_ee16", commanded_ee16, 16))
+    row.update(vector_fields("commanded_qpos14", commanded_qpos14, 14))
+    row.update(read_actual_robot_state(task))
+    rows.append(row)
+
+
+def actual_trace_step_items(
+    obs_list: list[Any],
+    env_action_chunk: np.ndarray,
+    qpos_chunk: torch.Tensor,
+    *,
+    env_step_start: int,
+    env_step_end: int,
+    execution_mode: str,
+) -> list[tuple[int, int | None, Any, np.ndarray | None, np.ndarray | None]]:
+    if execution_mode == "ee16_zero_residual":
+        items = []
+        if len(obs_list) == env_action_chunk.shape[1]:
+            for index, step_obs in enumerate(obs_list):
+                items.append(
+                    (
+                        int(env_step_start + index + 1),
+                        int(index),
+                        step_obs,
+                        np.asarray(env_action_chunk[0, index], dtype=np.float64),
+                        None,
+                    )
+                )
+            return items
+        action_index = env_action_chunk.shape[1] - 1
+        return [
+            (
+                int(env_step_end),
+                int(action_index),
+                obs_list[-1] if obs_list else None,
+                np.asarray(env_action_chunk[0, action_index], dtype=np.float64),
+                None,
+            )
+        ]
+    action_index = qpos_chunk.shape[1] - 1
+    return [
+        (
+            int(env_step_end),
+            int(action_index),
+            obs_list[-1] if obs_list else None,
+            None,
+            qpos_chunk[0, action_index].detach().cpu().numpy().astype(np.float64),
+        )
+    ]
+
+
+def read_actual_robot_state(task: Any) -> dict[str, Any]:
+    row: dict[str, Any] = {}
+    try:
+        qpos14 = read_task_qpos14(task)
+    except Exception:  # noqa: BLE001
+        qpos14 = None
+    row.update(vector_fields("actual_qpos14", qpos14, 14))
+    if qpos14 is not None:
+        try:
+            pose16 = read_pose16(task, qpos14)
+        except Exception:  # noqa: BLE001
+            pose16 = None
+    else:
+        pose16 = None
+    row.update(vector_fields("actual_left_ee_pose", None if pose16 is None else pose16[0:7], 7))
+    row.update(vector_fields("actual_right_ee_pose", None if pose16 is None else pose16[8:15], 7))
+    row["actual_left_gripper"] = None if qpos14 is None else float(qpos14[6])
+    row["actual_right_gripper"] = None if qpos14 is None else float(qpos14[13])
+    object_state = read_object_state(task)
+    row.update(object_state)
+    return row
+
+
+def read_object_state(task: Any) -> dict[str, Any]:
+    candidates = object_candidates(task)
+    row: dict[str, Any] = {
+        "object_state_source": None,
+        "object_state_available": False,
+        "contact_state_available": False,
+    }
+    for name, obj in candidates:
+        pose = read_pose_like(obj)
+        if pose is None:
+            continue
+        row["object_state_source"] = name
+        row["object_state_available"] = True
+        row.update(vector_fields("object_pose", pose, len(pose)))
+        row.update(vector_fields("object_linear_velocity", read_velocity_like(obj, "linear"), 3))
+        row.update(vector_fields("object_angular_velocity", read_velocity_like(obj, "angular"), 3))
+        return row
+    row.update(vector_fields("object_pose", None, 7))
+    row.update(vector_fields("object_linear_velocity", None, 3))
+    row.update(vector_fields("object_angular_velocity", None, 3))
+    return row
+
+
+def object_candidates(task: Any) -> list[tuple[str, Any]]:
+    names = (
+        "box",
+        "block",
+        "cube",
+        "object",
+        "obj",
+        "target_object",
+        "target_obj",
+        "item",
+        "manipulated_object",
+    )
+    candidates = [(name, getattr(task, name)) for name in names if hasattr(task, name)]
+    for container_name in ("objects", "actors", "articulations"):
+        container = getattr(task, container_name, None)
+        if isinstance(container, dict):
+            candidates.extend((f"{container_name}.{key}", value) for key, value in container.items())
+        elif isinstance(container, (list, tuple)):
+            candidates.extend((f"{container_name}.{idx}", value) for idx, value in enumerate(container))
+    return candidates
+
+
+def read_pose_like(obj: Any) -> np.ndarray | None:
+    for method_name in ("get_pose", "get_root_pose", "pose"):
+        value = call_or_attr(obj, method_name)
+        pose = pose_value_to_array(value)
+        if pose is not None:
+            return pose
+    for method_name in ("get_p", "get_position"):
+        value = call_or_attr(obj, method_name)
+        if value is not None:
+            arr = safe_array(value)
+            if arr is not None and arr.size >= 3:
+                return arr.reshape(-1)[:3]
+    return None
+
+
+def read_velocity_like(obj: Any, kind: str) -> np.ndarray | None:
+    names = (
+        ("get_linear_velocity", "linear_velocity", "lin_vel", "velocity")
+        if kind == "linear"
+        else ("get_angular_velocity", "angular_velocity", "ang_vel")
+    )
+    for name in names:
+        value = call_or_attr(obj, name)
+        arr = safe_array(value)
+        if arr is not None and arr.size >= 3:
+            return arr.reshape(-1)[:3]
+    return None
+
+
+def call_or_attr(obj: Any, name: str) -> Any:
+    if not hasattr(obj, name):
+        return None
+    value = getattr(obj, name)
+    if callable(value):
+        try:
+            return value()
+        except TypeError:
+            return None
+    return value
+
+
+def pose_value_to_array(value: Any) -> np.ndarray | None:
+    if value is None:
+        return None
+    if hasattr(value, "p") and hasattr(value, "q"):
+        p = safe_array(getattr(value, "p"))
+        q = safe_array(getattr(value, "q"))
+        if p is not None and q is not None:
+            return np.concatenate((p.reshape(-1)[:3], q.reshape(-1)[:4]))
+    arr = safe_array(value)
+    if arr is not None and arr.size in {3, 7}:
+        return arr.reshape(-1)
+    return None
+
+
+def safe_array(value: Any) -> np.ndarray | None:
+    try:
+        if hasattr(value, "detach") and callable(value.detach):
+            value = value.detach().cpu().numpy()
+        return np.asarray(value, dtype=np.float64)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def vector_fields(prefix: str, value: Any, size: int) -> dict[str, float | None]:
+    arr = safe_array(value)
+    if arr is not None:
+        arr = arr.reshape(-1)
+    return {
+        f"{prefix}_{idx:02d}": None if arr is None or idx >= arr.size else float(arr[idx])
+        for idx in range(size)
+    }
+
+
+def red_pixel_count_from_obs(obs: Any, video_source: str) -> int | None:
+    frame = frame_from_obs(obs, video_source)
+    if frame is None:
+        return None
+    arr = np.asarray(frame)
+    if arr.ndim != 3 or arr.shape[-1] < 3:
+        return None
+    red = arr[..., 0].astype(np.int16)
+    green = arr[..., 1].astype(np.int16)
+    blue = arr[..., 2].astype(np.int16)
+    mask = (red > 120) & (red > green + 35) & (red > blue + 35)
+    return int(mask.sum())
+
+
+def save_actual_state_trace(save_dir: Path, rows: list[dict[str, Any]]) -> Path | None:
+    if not rows:
+        return None
+    csv_path = save_dir / "actual_state_trace.csv"
+    fieldnames = sorted({key for row in rows for key in row})
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+    parquet_path = save_dir / "actual_state_trace.parquet"
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        pq.write_table(pa.Table.from_pylist(rows), parquet_path)
+    except Exception as exc:  # noqa: BLE001
+        write_json(save_dir / "actual_state_trace_parquet_error.json", {"error": str(exc)})
+    return csv_path
 
 
 def read_success(task: Any, info: dict[str, Any], done: bool) -> bool:
